@@ -4,7 +4,8 @@
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
 authenticate_stateful / authenticate_session / validate_session /
-terminate_session / set_session_limit 操作，并向标准输出写入紧凑 JSON 结果。
+terminate_session / set_session_limit / set_admission_policy /
+check_admission 操作，并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
 
@@ -34,6 +35,11 @@ LIFETIME_MIN = 1
 LIFETIME_MAX = 86400
 MAX_SESSIONS_MIN = 0
 MAX_SESSIONS_MAX = 64
+PORT_ID_MIN_LENGTH = 1
+PORT_ID_MAX_LENGTH = 64
+VLAN_ID_MIN = 1
+VLAN_ID_MAX = 4094
+MAX_POLICY_RULES = 64
 
 # authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与锁定时长。
 MAX_NOW = 9007199254740991
@@ -56,6 +62,8 @@ _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
 _OPERATION_TERMINATE_SESSION = "terminate_session"
 _OPERATION_SET_SESSION_LIMIT = "set_session_limit"
+_OPERATION_SET_ADMISSION_POLICY = "set_admission_policy"
+_OPERATION_CHECK_ADMISSION = "check_admission"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -87,6 +95,18 @@ _REQUIRED_KEYS = {
         "operation",
         "user_id",
         "max_sessions",
+    ),
+    _OPERATION_SET_ADMISSION_POLICY: (
+        "operation",
+        "user_id",
+        "rules",
+    ),
+    _OPERATION_CHECK_ADMISSION: (
+        "operation",
+        "session_id",
+        "now",
+        "port_id",
+        "vlan_id",
     ),
 }
 
@@ -166,6 +186,12 @@ class UserRegistry:
     用户不限并发。上限只约束 authenticate_session 创建新会话：在本次
     now 下未终止且 now 小于 expires_at 的会话计入并发，已过期会话保留
     记录但不计入；达到上限时拒绝创建，既有会话不被终止。
+
+    另维护每用户准入策略 _admission_policies
+    （user_id -> frozenset[(port_id, vlan_id)]）；未配置的用户默认拒绝
+    准入（policy_not_configured），配置为空集同样拒绝（policy_denied）。
+    策略只影响 check_admission 的判定，不影响凭据、认证状态、已有会话
+    与并发限额。
     """
 
     def __init__(self):
@@ -173,6 +199,7 @@ class UserRegistry:
         self._states = {}
         self._sessions = {}
         self._session_limits = {}
+        self._admission_policies = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -183,6 +210,7 @@ class UserRegistry:
         clone._states = dict(self._states)
         clone._sessions = dict(self._sessions)
         clone._session_limits = dict(self._session_limits)
+        clone._admission_policies = dict(self._admission_policies)
         return clone
 
     def register(self, user_id, password, salt):
@@ -293,6 +321,47 @@ class UserRegistry:
             raise UnknownUserError(user_id)
         self._session_limits[user_id] = max_sessions
 
+    def set_admission_policy(self, user_id, rules):
+        """为已登记用户设置准入策略；rules 为 (port_id, vlan_id) 对的序列。
+
+        重复提交相同策略幂等，提交不同策略完整替换旧值；空策略合法，表示
+        拒绝一切准入。策略不影响凭据、认证状态、已有会话与并发限额。
+        未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        self._admission_policies[user_id] = frozenset(rules)
+
+    def check_admission(self, session_id, now, port_id, vlan_id):
+        """按注入时间检查会话是否仍有效，并按所属用户策略判定端口准入。
+
+        返回 (status, reason, user_id) 并提交本次检查时间；会话状态与
+        时间单调语义同 validate_session：now 早于该会话最近已提交的检查
+        时间时抛出 SessionTimeRegressionError，状态不变；已终止的会话
+        一律返回 denied/session_terminated；now >= expires_at 返回
+        denied/session_expired。活动会话按所属用户策略精确匹配
+        (port_id, vlan_id)：命中返回 accepted；未配置策略返回
+        denied/policy_not_configured；空策略或未命中返回
+        denied/policy_denied。未知会话抛出 UnknownSessionError。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        user_id, expires_at, last_check, terminated_at = record
+        if last_check is not None and now < last_check:
+            raise SessionTimeRegressionError(session_id, now, last_check)
+        self._sessions[session_id] = (user_id, expires_at, now, terminated_at)
+        if terminated_at is not None:
+            return ("denied", "session_terminated", user_id)
+        if now >= expires_at:
+            return ("denied", "session_expired", user_id)
+        policy = self._admission_policies.get(user_id)
+        if policy is None:
+            return ("denied", "policy_not_configured", user_id)
+        if (port_id, vlan_id) in policy:
+            return ("accepted", None, user_id)
+        return ("denied", "policy_denied", user_id)
+
     def validate_session(self, session_id, now):
         """按注入时间校验会话是否仍未过期、未终止。
 
@@ -383,6 +452,41 @@ def _validate_now_type(index, operation):
     return _validate_integer_field(operation, "now", index)
 
 
+def _validate_port_id(operation, key, index):
+    """校验 port_id 字段：字符串类型、长度与不含控制字符。"""
+    port_id = _validate_string_field(operation, key, index)
+    if not (PORT_ID_MIN_LENGTH <= len(port_id) <= PORT_ID_MAX_LENGTH):
+        raise BatchError(
+            "value_error",
+            index,
+            "port_id must be %d..%d Unicode code points, got %d"
+            % (PORT_ID_MIN_LENGTH, PORT_ID_MAX_LENGTH, len(port_id)),
+            EXIT_VALUE_ERROR,
+        )
+    if not _is_control_free(port_id):
+        raise BatchError(
+            "value_error",
+            index,
+            "port_id must not contain control characters",
+            EXIT_VALUE_ERROR,
+        )
+    return port_id
+
+
+def _validate_vlan_id(operation, key, index):
+    """校验 vlan_id 字段：JSON 整数类型与取值范围。"""
+    vlan_id = _validate_integer_field(operation, key, index)
+    if not (VLAN_ID_MIN <= vlan_id <= VLAN_ID_MAX):
+        raise BatchError(
+            "value_error",
+            index,
+            "vlan_id must be %d..%d, got %d"
+            % (VLAN_ID_MIN, VLAN_ID_MAX, vlan_id),
+            EXIT_VALUE_ERROR,
+        )
+    return vlan_id
+
+
 def _validate_now_range(index, now, max_added=LOCK_DURATION_SECONDS):
     """校验 now 的取值范围：0..MAX_NOW 且加上给定上限后不越界。"""
     if not (0 <= now <= MAX_NOW):
@@ -418,7 +522,8 @@ def _validate_operation(index, operation):
             index,
             "field 'operation' must be 'register', 'authenticate', "
             "'authenticate_stateful', 'authenticate_session', "
-            "'validate_session', 'terminate_session' or 'set_session_limit'",
+            "'validate_session', 'terminate_session', 'set_session_limit', "
+            "'set_admission_policy' or 'check_admission'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -442,6 +547,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_SET_SESSION_LIMIT,
+        _OPERATION_SET_ADMISSION_POLICY,
     )
     if needs_user:
         user_id = _validate_string_field(operation, "user_id", index)
@@ -499,6 +605,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
         _OPERATION_TERMINATE_SESSION,
+        _OPERATION_CHECK_ADMISSION,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
@@ -511,6 +618,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
         _OPERATION_TERMINATE_SESSION,
+        _OPERATION_CHECK_ADMISSION,
     ):
         session_id = _validate_string_field(operation, "session_id", index)
         if not (
@@ -562,6 +670,77 @@ def _validate_operation(index, operation):
                 EXIT_VALUE_ERROR,
             )
         validated["max_sessions"] = max_sessions
+
+    if kind == _OPERATION_SET_ADMISSION_POLICY:
+        rules = operation.get("rules")
+        if not isinstance(rules, list):
+            raise BatchError(
+                "parameter_error",
+                index,
+                "field 'rules' must be an array",
+                EXIT_PARAMETER_ERROR,
+            )
+        # 先完成全部结构/类型校验（parameter_error），再做取值校验
+        # （value_error），保证错误分型与字段顺序无关。
+        for rule_index, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d] must be a JSON object" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            if set(rule) != {"port_id", "vlan_id"}:
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d] must contain exactly 'port_id' and 'vlan_id'"
+                    % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            if not isinstance(rule["port_id"], str):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d].port_id must be a string" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            vlan_id = rule["vlan_id"]
+            if isinstance(vlan_id, bool) or not isinstance(vlan_id, int):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d].vlan_id must be a JSON integer" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+        if len(rules) > MAX_POLICY_RULES:
+            raise BatchError(
+                "value_error",
+                index,
+                "rules must contain at most %d entries, got %d"
+                % (MAX_POLICY_RULES, len(rules)),
+                EXIT_VALUE_ERROR,
+            )
+        pairs = []
+        for rule_index, rule in enumerate(rules):
+            pairs.append(
+                (
+                    _validate_port_id(rule, "port_id", index),
+                    _validate_vlan_id(rule, "vlan_id", index),
+                )
+            )
+        if len(set(pairs)) != len(pairs):
+            raise BatchError(
+                "value_error",
+                index,
+                "rules must not contain duplicate (port_id, vlan_id) pairs",
+                EXIT_VALUE_ERROR,
+            )
+        validated["rules"] = pairs
+
+    if kind == _OPERATION_CHECK_ADMISSION:
+        validated["port_id"] = _validate_port_id(operation, "port_id", index)
+        validated["vlan_id"] = _validate_vlan_id(operation, "vlan_id", index)
 
     return validated
 
@@ -743,6 +922,57 @@ def run_batch(registry, operations):
                     "max_sessions": op["max_sessions"],
                 }
             )
+        elif kind == _OPERATION_SET_ADMISSION_POLICY:
+            user_id = op["user_id"]
+            try:
+                working.set_admission_policy(user_id, op["rules"])
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_SET_ADMISSION_POLICY,
+                    "user_id": user_id,
+                    "status": "configured",
+                    "rule_count": len(op["rules"]),
+                }
+            )
+        elif kind == _OPERATION_CHECK_ADMISSION:
+            session_id = op["session_id"]
+            try:
+                status, reason, session_user_id = working.check_admission(
+                    session_id, op["now"], op["port_id"], op["vlan_id"]
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except SessionTimeRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for session: %s"
+                    % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_CHECK_ADMISSION,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "port_id": op["port_id"],
+                    "vlan_id": op["vlan_id"],
+                    "status": status,
+                    "reason": reason,
+                }
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -779,6 +1009,7 @@ def run_batch(registry, operations):
     registry._states = working._states
     registry._sessions = working._sessions
     registry._session_limits = working._session_limits
+    registry._admission_policies = working._admission_policies
     return results
 
 
@@ -857,7 +1088,8 @@ def _build_parser():
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
             "authenticate_session / validate_session / terminate_session /\n"
-            "set_session_limit 操作，向标准输出写入紧凑 JSON 结果。\n"
+            "set_session_limit / set_admission_policy / check_admission 操作，\n"
+            "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
         epilog=(
@@ -874,6 +1106,11 @@ def _build_parser():
             "  lifetime (仅 authenticate_session): 1..86400 的 JSON 整数秒，\n"
             "  且 now+lifetime 不得超过 9007199254740991。\n"
             "  max_sessions (仅 set_session_limit): 0..64 的 JSON 整数。\n"
+            "  port_id (准入操作): 字符串，1..64 个 Unicode 码点，不含控制字符。\n"
+            "  vlan_id (准入操作): 1..4094 的 JSON 整数。\n"
+            "  rules (仅 set_admission_policy): 最多 64 项的 JSON 数组，每项为仅含\n"
+            "  port_id 与 vlan_id 的对象；(port_id, vlan_id) 匹配对不得重复，\n"
+            "  顺序不影响策略语义。\n"
             "  字符串按原值处理：不去空白、不改大小写、不做 Unicode 归一化。\n"
             "  操作对象只允许上述字段；凭据编码为\n"
             "  pbkdf2_sha256$200000$盐十六进制$摘要十六进制，输出不含明文口令。\n"
@@ -923,12 +1160,35 @@ def _build_parser():
             "  降低上限亦然，直至活动数低于上限。引用未知用户整批 unknown_user。\n"
             "  结果键序为 operation、user_id、status、max_sessions，status 为\n"
             "  configured。\n"
+            "set_admission_policy:\n"
+            "  为已登记用户设置准入策略，接收 user_id 与 rules。rules 是最多 64 项\n"
+            "  的 JSON 数组，每项为仅含 port_id 与 vlan_id 的对象；port_id 为\n"
+            "  1..64 个无控制字符 (Cc) 的 Unicode 码点，vlan_id 为 1..4094 的\n"
+            "  JSON 整数；(port_id, vlan_id) 匹配对不得重复，顺序不影响策略语义。\n"
+            "  未配置或空策略均默认拒绝准入。重复提交相同策略幂等，提交不同策略\n"
+            "  完整替换旧值；不影响凭据、认证状态、已有会话与并发限额。引用未知\n"
+            "  用户整批 unknown_user。结果键序为 operation、user_id、status、\n"
+            "  rule_count，status 为 configured。\n"
+            "check_admission:\n"
+            "  按注入时间检查会话有效性并按所属用户策略判定端口准入，接收\n"
+            "  session_id、now、port_id、vlan_id，字段约束同上。会话状态与时间\n"
+            "  单调语义同 validate_session：now 早于该会话最近已提交的检查时间\n"
+            "  整批 state_error（状态不变，相等时间允许重复检查）；未知\n"
+            "  session_id 整批 unknown_session。已终止的会话返回\n"
+            "  denied/session_terminated；已过期的会话返回 denied/session_expired；\n"
+            "  活动会话按所属用户策略精确匹配 (port_id, vlan_id)：命中返回\n"
+            "  accepted 且 reason 为 null；未配置策略返回\n"
+            "  denied/policy_not_configured；空策略或未命中返回\n"
+            "  denied/policy_denied。正常判定均提交本次会话检查时间，异常则整批\n"
+            "  回滚。结果键序为 operation、session_id、user_id、port_id、\n"
+            "  vlan_id、status、reason。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
-            "      session_expired、session_terminated、session_limit_reached\n"
-            "      与终止结果）\n"
+            "      session_expired、session_terminated、session_limit_reached、\n"
+            "      policy_not_configured、policy_denied 与终止结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
-            "  3  value_error：长度、salt 编码、now/lifetime 范围或批量上限错误\n"
+            "  3  value_error：长度、salt 编码、now/lifetime 范围、规则数量、\n"
+            "      重复匹配对或批量上限错误\n"
             "  4  duplicate_user：重复登记（不覆盖原凭据）\n"
             "  5  unknown_user：操作引用了未登记的用户\n"
             "  6  state_error：now 早于该用户或会话上次已提交时间\n"
