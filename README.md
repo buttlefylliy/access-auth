@@ -45,15 +45,28 @@
 * `validate_session`：按注入时间校验会话，接收 session_id、`now`。
   * 会话保存最近已提交的检查时间；`now` 早于该值整批 `state_error`（退出码 6），
     状态不变；相等时间允许重复检查。
-  * `now < expires_at`：accepted；`now >= expires_at`：denied/session_expired，
-    过期为终态。检查不刷新过期时刻，也不改变用户认证状态，时间只取自输入。
+  * 已终止的会话一律 denied/session_terminated；否则 `now < expires_at`：
+    accepted；`now >= expires_at`：denied/session_expired，过期为终态。
+    检查不刷新过期时刻，也不改变用户认证状态，时间只取自输入。
   * 未知 session_id 整批 `unknown_session`（退出码 8）。
   * 结果键序固定为 operation、session_id、user_id、status、reason、expires_at。
+* `terminate_session`：按注入时间主动终止有效会话，接收 session_id、`now`，
+  字段校验与 `validate_session` 相同，遵循同一会话时间单调规则。
+  * 终止成功：status 为 terminated、reason 为 null、terminated_at 为首次
+    终止时间、expires_at 为原过期时刻；不改变用户失败计数、锁定状态或其他会话。
+  * `now >= expires_at`：会话保持过期终态，返回 denied/session_expired、
+    terminated_at 为 null，不留下终止标记。
+  * 已终止的会话重复终止幂等返回首次 terminated_at，不改写终止时间；
+    此后 `validate_session` 无论是否达到原过期时间都返回
+    denied/session_terminated。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）。
+  * 结果键序固定为 operation、session_id、user_id、status、reason、
+    terminated_at、expires_at。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态
-与会话恢复到批次开始前，普通拒绝与会话过期作为成功结果提交。未知用户报
+与会话恢复到批次开始前，普通拒绝、会话过期与会话终止作为成功结果提交。未知用户报
 `unknown_user`（退出码 5）。字段缺失、类型错误或多余字段报
 `parameter_error`（退出码 2），范围错误报 `value_error`（退出码 3）。
 详细字段限制与退出码见 `python access_auth.py --help`。
