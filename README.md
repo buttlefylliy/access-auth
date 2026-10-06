@@ -129,11 +129,32 @@
   * 引用未知用户整批 `unknown_user`（退出码 5）。
   * 结果键序固定为 operation、user_id、status、idle_timeout，status 为
     configured。
+* `list_authentication_events`：为已登记用户返回本进程当前批次内已提交的
+  认证轨迹，仅接收 operation、user_id，便于确定地审计结果与失败原因。
+  * 轨迹只覆盖 `authenticate_stateful` 与 `authenticate_session`；无状态
+    `authenticate` 继续只做口令校验，不产生事件。每个上述认证操作得到普通
+    业务结果后，为对应用户按提交顺序追加一条事件，sequence 从 1 连续编号。
+  * 事件固定键序为 sequence、source、now、status、reason、session_id；
+    source 为触发操作名，now 使用显式输入值，status 与 reason 等于该操作的
+    对外结果；`authenticate_stateful` 的 session_id 为 null，
+    `authenticate_session` 无论接受、口令拒绝、锁定或达到并发上限，都记录
+    请求中的 session_id。事件不含口令、盐、编码凭据或摘要。
+  * 只有已经作为普通结果提交的认证尝试才进入轨迹：未知用户整批抛
+    `unknown_user`（退出码 5）；时间回退、重复 session_id 等导致批次失败的
+    异常不留下事件；本批后续任一操作失败时，先前新增事件也随其他状态一起
+    回滚。每个有状态认证操作至多新增一条，因此事件总数受现有每批 1000 个
+    操作上限约束。
+  * 查询为只读：结果固定键序为 operation、user_id、status、event_count、
+    events，status 为 reported，events 按 sequence 升序，无事件时返回空数组
+    和 0；重复查询返回逐字节相同内容，不推进认证时间、会话检查时间或活动
+    时间，也不生成事件。字段缺失、额外字段或类型错误仍为 `parameter_error`
+    （退出码 2）。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额、准入策略、默认准入动作与空闲超时配置恢复到批次开始前，普通
+会话、并发限额、准入策略、默认准入动作、空闲超时配置与认证事件轨迹恢复到
+批次开始前，普通
 拒绝、会话过期、
 空闲过期与会话终止作为成功结果提交。未知用户报
 `unknown_user`（退出码 5）。字段缺失、类型错误或多余字段报
