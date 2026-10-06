@@ -84,17 +84,31 @@
     `vlan_id` 为 1..4094 的 JSON 整数；(port_id, vlan_id) 匹配对不得重复，
     顺序不影响策略语义。
   * 未配置或空策略均默认拒绝准入；重复提交相同策略幂等，提交不同策略完整
-    替换旧值；不影响凭据、认证状态、已有会话与并发限额。
+    替换旧值；只替换精确规则，保留已配置的默认准入动作；不影响凭据、认证
+    状态、已有会话与并发限额。
   * 引用未知用户整批 `unknown_user`（退出码 5）。
   * 结果键序固定为 operation、user_id、status、rule_count，status 为
+    configured。
+* `set_admission_default`：为已登记用户设置默认准入动作，接收 user_id、
+  `default_action`（字符串 `allow` 或 `deny`）。
+  * 重复设置相同值幂等，新值覆盖旧值；每用户至多保存一个默认动作。
+  * 默认动作只影响 `check_admission` 对未命中精确规则时的判定，适用于所有
+    合法端口和 VLAN；只配置默认动作而没有精确规则也视为策略已配置。
+  * 设置默认动作不改写精确规则、凭据、认证状态、已有会话、并发限额或超时
+    配置；已有活动会话在下一次 `check_admission` 时使用新值。
+  * 引用未知用户整批 `unknown_user`（退出码 5）。
+  * 结果键序固定为 operation、user_id、status、default_action，status 为
     configured。
 * `check_admission`：按注入时间检查会话有效性并按所属用户策略判定端口准入，
   接收 session_id、`now`、`port_id`、`vlan_id`，字段约束同上；会话状态与
   时间单调语义同 `validate_session`。
   * 已终止的会话返回 denied/session_terminated；已过期的会话返回
     denied/session_expired；活动会话按所属用户策略精确匹配
-    (port_id, vlan_id)：命中返回 accepted 且 reason 为 null；未配置策略返回
-    denied/policy_not_configured；空策略或未命中返回 denied/policy_denied。
+    (port_id, vlan_id)：命中返回 accepted 且 reason 为 null；未命中时若该
+    用户配置了默认准入动作，`allow` 返回 accepted 且 reason 为 null，
+    `deny` 返回 denied/policy_denied；精确规则与默认动作均未配置返回
+    denied/policy_not_configured；已配置精确规则（含空集）但未配置默认
+    动作且未命中返回 denied/policy_denied。
   * 正常判定均提交本次会话检查时间，异常则整批回滚；未知 session_id 整批
     `unknown_session`（退出码 8），时间回退整批 `state_error`（退出码 6）。
   * 结果键序固定为 operation、session_id、user_id、port_id、vlan_id、
@@ -119,7 +133,8 @@
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额、准入策略与空闲超时配置恢复到批次开始前，普通拒绝、会话过期、
+会话、并发限额、准入策略、默认准入动作与空闲超时配置恢复到批次开始前，普通
+拒绝、会话过期、
 空闲过期与会话终止作为成功结果提交。未知用户报
 `unknown_user`（退出码 5）。字段缺失、类型错误或多余字段报
 `parameter_error`（退出码 2），范围错误报 `value_error`（退出码 3）。
