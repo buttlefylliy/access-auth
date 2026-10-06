@@ -4,7 +4,7 @@
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
 authenticate_stateful / authenticate_session / validate_session /
-terminate_session 操作，并向标准输出写入紧凑 JSON 结果。
+terminate_session / set_session_limit 操作，并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
 
@@ -32,6 +32,8 @@ SESSION_ID_MIN_LENGTH = 1
 SESSION_ID_MAX_LENGTH = 64
 LIFETIME_MIN = 1
 LIFETIME_MAX = 86400
+MAX_SESSIONS_MIN = 0
+MAX_SESSIONS_MAX = 64
 
 # authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与锁定时长。
 MAX_NOW = 9007199254740991
@@ -53,6 +55,7 @@ _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
 _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
 _OPERATION_TERMINATE_SESSION = "terminate_session"
+_OPERATION_SET_SESSION_LIMIT = "set_session_limit"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -79,6 +82,11 @@ _REQUIRED_KEYS = {
         "operation",
         "session_id",
         "now",
+    ),
+    _OPERATION_SET_SESSION_LIMIT: (
+        "operation",
+        "user_id",
+        "max_sessions",
     ),
 }
 
@@ -153,12 +161,18 @@ class UserRegistry:
     会话过期与终止都是终态：记录保留在表中直至进程结束，重复创建同 id
     仍判为重复，过期后重复校验仍返回 session_expired，终止后校验一律
     返回 session_terminated，重复终止幂等返回首次 terminated_at。
+
+    另维护每用户并发会话上限 _session_limits（user_id -> int）；未配置的
+    用户不限并发。上限只约束 authenticate_session 创建新会话：在本次
+    now 下未终止且 now 小于 expires_at 的会话计入并发，已过期会话保留
+    记录但不计入；达到上限时拒绝创建，既有会话不被终止。
     """
 
     def __init__(self):
         self._credentials = {}
         self._states = {}
         self._sessions = {}
+        self._session_limits = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -168,6 +182,7 @@ class UserRegistry:
         clone._credentials = dict(self._credentials)
         clone._states = dict(self._states)
         clone._sessions = dict(self._sessions)
+        clone._session_limits = dict(self._session_limits)
         return clone
 
     def register(self, user_id, password, salt):
@@ -236,6 +251,12 @@ class UserRegistry:
         now + lifetime，初始检查时间为 None。拒绝时不创建会话。
         未知用户抛出 UnknownUserError；now 回退抛出 StateRegressionError；
         session_id 已存在（含已过期的终态记录）抛出 DuplicateSessionError。
+
+        若该用户已配置并发上限，则在口令被接受且 session_id 未使用后检查
+        容量：本次 now 下属于该用户、未终止且 now 小于 expires_at 的会话
+        计入并发（已过期会话保留记录但不计入）；活动数达到上限时返回
+        denied/session_limit_reached、expires_at 为 None，不创建会话，
+        正确口令清零失败计数的效果仍提交。降低上限不终止已有会话。
         """
         status, reason, _failed_attempts, _locked_until = (
             self.authenticate_stateful(user_id, password, now)
@@ -244,9 +265,33 @@ class UserRegistry:
             return ("denied", reason, None)
         if session_id in self._sessions:
             raise DuplicateSessionError(session_id)
+        limit = self._session_limits.get(user_id)
+        if limit is not None:
+            active = 0
+            for session_user_id, expires_at, _last_check, terminated_at in (
+                self._sessions.values()
+            ):
+                if (
+                    session_user_id == user_id
+                    and terminated_at is None
+                    and now < expires_at
+                ):
+                    active += 1
+            if active >= limit:
+                return ("denied", "session_limit_reached", None)
         expires_at = now + lifetime
         self._sessions[session_id] = (user_id, expires_at, None, None)
         return ("accepted", None, expires_at)
+
+    def set_session_limit(self, user_id, max_sessions):
+        """为已登记用户设置并发会话上限；重复设置相同值幂等，新值覆盖旧值。
+
+        未配置的用户不限并发。上限只约束新会话创建，不终止已有会话。
+        未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        self._session_limits[user_id] = max_sessions
 
     def validate_session(self, session_id, now):
         """按注入时间校验会话是否仍未过期、未终止。
@@ -373,7 +418,7 @@ def _validate_operation(index, operation):
             index,
             "field 'operation' must be 'register', 'authenticate', "
             "'authenticate_stateful', 'authenticate_session', "
-            "'validate_session' or 'terminate_session'",
+            "'validate_session', 'terminate_session' or 'set_session_limit'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -396,6 +441,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE,
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_AUTHENTICATE_SESSION,
+        _OPERATION_SET_SESSION_LIMIT,
     )
     if needs_user:
         user_id = _validate_string_field(operation, "user_id", index)
@@ -502,6 +548,20 @@ def _validate_operation(index, operation):
             )
         _validate_now_range(index, now, lifetime)
         validated["lifetime"] = lifetime
+
+    if kind == _OPERATION_SET_SESSION_LIMIT:
+        max_sessions = _validate_integer_field(
+            operation, "max_sessions", index
+        )
+        if not (MAX_SESSIONS_MIN <= max_sessions <= MAX_SESSIONS_MAX):
+            raise BatchError(
+                "value_error",
+                index,
+                "max_sessions must be %d..%d, got %d"
+                % (MAX_SESSIONS_MIN, MAX_SESSIONS_MAX, max_sessions),
+                EXIT_VALUE_ERROR,
+            )
+        validated["max_sessions"] = max_sessions
 
     return validated
 
@@ -664,6 +724,25 @@ def run_batch(registry, operations):
                     "expires_at": expires_at,
                 }
             )
+        elif kind == _OPERATION_SET_SESSION_LIMIT:
+            user_id = op["user_id"]
+            try:
+                working.set_session_limit(user_id, op["max_sessions"])
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_SET_SESSION_LIMIT,
+                    "user_id": user_id,
+                    "status": "configured",
+                    "max_sessions": op["max_sessions"],
+                }
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -699,6 +778,7 @@ def run_batch(registry, operations):
     registry._credentials = working._credentials
     registry._states = working._states
     registry._sessions = working._sessions
+    registry._session_limits = working._session_limits
     return results
 
 
@@ -776,8 +856,8 @@ def _build_parser():
         description=(
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
-            "authenticate_session / validate_session / terminate_session 操作，\n"
-            "向标准输出写入紧凑 JSON 结果。\n"
+            "authenticate_session / validate_session / terminate_session /\n"
+            "set_session_limit 操作，向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
         epilog=(
@@ -793,6 +873,7 @@ def _build_parser():
             "  session_id (会话操作): 字符串，1..64 个 Unicode 码点，不含控制字符。\n"
             "  lifetime (仅 authenticate_session): 1..86400 的 JSON 整数秒，\n"
             "  且 now+lifetime 不得超过 9007199254740991。\n"
+            "  max_sessions (仅 set_session_limit): 0..64 的 JSON 整数。\n"
             "  字符串按原值处理：不去空白、不改大小写、不做 Unicode 归一化。\n"
             "  操作对象只允许上述字段；凭据编码为\n"
             "  pbkdf2_sha256$200000$盐十六进制$摘要十六进制，输出不含明文口令。\n"
@@ -806,8 +887,14 @@ def _build_parser():
             "  沿用 authenticate_stateful 的凭据校验、时间单调性、失败计数与\n"
             "  锁定语义；accepted 时创建内存会话，expires_at=now+lifetime，\n"
             "  拒绝时不创建会话，expires_at 为 null。session_id 重复（含已过期\n"
-            "  的终态会话）整批 duplicate_session。结果键序为 operation、\n"
-            "  user_id、session_id、status、reason、expires_at。\n"
+            "  的终态会话）整批 duplicate_session。若该用户已通过\n"
+            "  set_session_limit 配置并发上限，则在口令被接受且 session_id\n"
+            "  未使用后检查容量：本次 now 下属于该用户、未终止且 now 小于\n"
+            "  expires_at 的会话计入并发（已过期会话保留记录但不计入）；\n"
+            "  活动数达到上限时返回 denied/session_limit_reached、expires_at\n"
+            "  为 null，不创建会话，正确口令清零失败计数的效果仍提交。\n"
+            "  结果键序为 operation、user_id、session_id、status、reason、\n"
+            "  expires_at。\n"
             "validate_session:\n"
             "  now 早于该会话最近已提交的检查时间时整批 state_error（状态不变，\n"
             "  相等时间允许重复检查）；已终止的会话一律返回\n"
@@ -826,9 +913,20 @@ def _build_parser():
             "  终止不改变用户失败计数、锁定状态或其他会话；未知 session_id\n"
             "  整批 unknown_session。结果键序为 operation、session_id、user_id、\n"
             "  status、reason、terminated_at、expires_at。\n"
+            "set_session_limit:\n"
+            "  为已登记用户设置进程内并发会话上限，接收 user_id 与 max_sessions\n"
+            "  （0..64 的 JSON 整数）。未配置的用户默认不限并发；重复提交相同值\n"
+            "  结果不变，提交新值覆盖旧值。上限只在 authenticate_session 创建\n"
+            "  新会话时生效：在本次 now 下属于该用户、未主动终止且 now 小于\n"
+            "  expires_at 的会话计入并发，已过期会话保留记录但不计入；达到上限\n"
+            "  时拒绝新会话（denied/session_limit_reached），不终止已有会话，\n"
+            "  降低上限亦然，直至活动数低于上限。引用未知用户整批 unknown_user。\n"
+            "  结果键序为 operation、user_id、status、max_sessions，status 为\n"
+            "  configured。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
-            "      session_expired、session_terminated 与终止结果）\n"
+            "      session_expired、session_terminated、session_limit_reached\n"
+            "      与终止结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
             "  3  value_error：长度、salt 编码、now/lifetime 范围或批量上限错误\n"
             "  4  duplicate_user：重复登记（不覆盖原凭据）\n"
