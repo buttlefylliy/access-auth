@@ -5,7 +5,8 @@
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
 authenticate_stateful / authenticate_session / validate_session /
 terminate_session / set_session_limit / set_admission_policy /
-check_admission 操作，并向标准输出写入紧凑 JSON 结果。
+check_admission / set_session_idle_timeout 操作，并向标准输出写入紧凑 JSON
+结果。
 行为契约见 README.md 与 --help。
 """
 
@@ -40,6 +41,8 @@ PORT_ID_MAX_LENGTH = 64
 VLAN_ID_MIN = 1
 VLAN_ID_MAX = 4094
 MAX_POLICY_RULES = 64
+IDLE_TIMEOUT_MIN = 0
+IDLE_TIMEOUT_MAX = 86400
 
 # authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与锁定时长。
 MAX_NOW = 9007199254740991
@@ -64,6 +67,7 @@ _OPERATION_TERMINATE_SESSION = "terminate_session"
 _OPERATION_SET_SESSION_LIMIT = "set_session_limit"
 _OPERATION_SET_ADMISSION_POLICY = "set_admission_policy"
 _OPERATION_CHECK_ADMISSION = "check_admission"
+_OPERATION_SET_SESSION_IDLE_TIMEOUT = "set_session_idle_timeout"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -107,6 +111,11 @@ _REQUIRED_KEYS = {
         "now",
         "port_id",
         "vlan_id",
+    ),
+    _OPERATION_SET_SESSION_IDLE_TIMEOUT: (
+        "operation",
+        "user_id",
+        "idle_timeout",
     ),
 }
 
@@ -176,11 +185,17 @@ class UserRegistry:
     不保留认证历史。
 
     会话仅驻留内存：session_id -> (user_id, expires_at, last_check,
-    terminated_at)，其中 last_check 为最近已提交的检查/终止时间（创建时为
-    None），terminated_at 为首次终止时间（未终止为 None）。
+    terminated_at, idle_timeout, last_activity, idle_expired)，其中
+    last_check 为最近已提交的检查/终止时间（创建时为 None），terminated_at
+    为首次终止时间（未终止为 None）；idle_timeout 为创建时快照的用户空闲
+    超时（0 表示关闭），last_activity 为最近活动时间（创建时为创建 now，
+    仅 validate_session / check_admission 对仍有效会话完成判定后刷新），
+    idle_expired 为空闲过期终态标志。
     会话过期与终止都是终态：记录保留在表中直至进程结束，重复创建同 id
     仍判为重复，过期后重复校验仍返回 session_expired，终止后校验一律
     返回 session_terminated，重复终止幂等返回首次 terminated_at。
+    空闲过期同样是终态：命中后两个检查入口一律返回 session_idle_expired，
+    terminate_session 也返回该原因且 terminated_at 为 null。
 
     另维护每用户并发会话上限 _session_limits（user_id -> int）；未配置的
     用户不限并发。上限只约束 authenticate_session 创建新会话：在本次
@@ -192,6 +207,10 @@ class UserRegistry:
     准入（policy_not_configured），配置为空集同样拒绝（policy_denied）。
     策略只影响 check_admission 的判定，不影响凭据、认证状态、已有会话
     与并发限额。
+
+    另维护每用户空闲超时 _idle_timeouts（user_id -> int，秒）；
+    未配置或配置为 0 均表示关闭空闲超时。配置只在创建会话时快照进会话
+    记录，已有会话沿用创建时的配置；lifetime 仍是不可延长的硬期限。
     """
 
     def __init__(self):
@@ -200,6 +219,7 @@ class UserRegistry:
         self._sessions = {}
         self._session_limits = {}
         self._admission_policies = {}
+        self._idle_timeouts = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -211,6 +231,7 @@ class UserRegistry:
         clone._sessions = dict(self._sessions)
         clone._session_limits = dict(self._session_limits)
         clone._admission_policies = dict(self._admission_policies)
+        clone._idle_timeouts = dict(self._idle_timeouts)
         return clone
 
     def register(self, user_id, password, salt):
@@ -282,9 +303,14 @@ class UserRegistry:
 
         若该用户已配置并发上限，则在口令被接受且 session_id 未使用后检查
         容量：本次 now 下属于该用户、未终止且 now 小于 expires_at 的会话
-        计入并发（已过期会话保留记录但不计入）；活动数达到上限时返回
+        计入并发（已过期会话保留记录但不计入）；已达到空闲期限（含已置
+        空闲终态）的会话同样不计入，计数不刷新任何会话的活动时间。
+        活动数达到上限时返回
         denied/session_limit_reached、expires_at 为 None，不创建会话，
         正确口令清零失败计数的效果仍提交。降低上限不终止已有会话。
+
+        创建会话时快照该用户当前的空闲超时配置（未配置或 0 表示关闭），
+        并以创建 now 作为首次活动时间；此后该用户的配置变更不影响此会话。
         """
         status, reason, _failed_attempts, _locked_until = (
             self.authenticate_stateful(user_id, password, now)
@@ -296,19 +322,40 @@ class UserRegistry:
         limit = self._session_limits.get(user_id)
         if limit is not None:
             active = 0
-            for session_user_id, expires_at, _last_check, terminated_at in (
-                self._sessions.values()
-            ):
+            for (
+                session_user_id,
+                expires_at,
+                _last_check,
+                terminated_at,
+                idle_timeout,
+                last_activity,
+                idle_expired,
+            ) in self._sessions.values():
                 if (
-                    session_user_id == user_id
-                    and terminated_at is None
-                    and now < expires_at
+                    session_user_id != user_id
+                    or terminated_at is not None
+                    or now >= expires_at
+                    or idle_expired
+                    or (
+                        idle_timeout
+                        and now >= last_activity + idle_timeout
+                    )
                 ):
-                    active += 1
+                    continue
+                active += 1
             if active >= limit:
                 return ("denied", "session_limit_reached", None)
         expires_at = now + lifetime
-        self._sessions[session_id] = (user_id, expires_at, None, None)
+        idle_timeout = self._idle_timeouts.get(user_id, 0)
+        self._sessions[session_id] = (
+            user_id,
+            expires_at,
+            None,
+            None,
+            idle_timeout,
+            now,
+            False,
+        )
         return ("accepted", None, expires_at)
 
     def set_session_limit(self, user_id, max_sessions):
@@ -332,29 +379,80 @@ class UserRegistry:
             raise UnknownUserError(user_id)
         self._admission_policies[user_id] = frozenset(rules)
 
+    def set_session_idle_timeout(self, user_id, idle_timeout):
+        """为已登记用户设置会话空闲超时（秒）；0 表示关闭。
+
+        重复设置相同值幂等，新值覆盖旧值但只作用于此后创建的会话，
+        已有会话沿用创建时快照的配置。未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        self._idle_timeouts[user_id] = idle_timeout
+
+    @staticmethod
+    def _idle_expired_now(idle_timeout, last_activity, now):
+        """判断启用空闲超时的会话在本次 now 下是否达到空闲期限。"""
+        return bool(idle_timeout) and now >= last_activity + idle_timeout
+
     def check_admission(self, session_id, now, port_id, vlan_id):
         """按注入时间检查会话是否仍有效，并按所属用户策略判定端口准入。
 
         返回 (status, reason, user_id) 并提交本次检查时间；会话状态与
         时间单调语义同 validate_session：now 早于该会话最近已提交的检查
         时间时抛出 SessionTimeRegressionError，状态不变；已终止的会话
-        一律返回 denied/session_terminated；now >= expires_at 返回
-        denied/session_expired。活动会话按所属用户策略精确匹配
+        一律返回 denied/session_terminated；已处于空闲过期终态的会话一律
+        返回 denied/session_idle_expired；否则先判断 now >= expires_at
+        返回 denied/session_expired，再判断启用了空闲超时的会话
+        now >= last_activity + idle_timeout，命中则置空闲过期终态并返回
+        denied/session_idle_expired。仍有效的会话按所属用户策略精确匹配
         (port_id, vlan_id)：命中返回 accepted；未配置策略返回
         denied/policy_not_configured；空策略或未命中返回
-        denied/policy_denied。未知会话抛出 UnknownSessionError。
+        denied/policy_denied；这些判定都以本次 now 刷新最近活动时间
+        （策略拒绝也算活动）。异常、时间回退、硬过期与空闲过期均不刷新。
+        未知会话抛出 UnknownSessionError。
         """
         record = self._sessions.get(session_id)
         if record is None:
             raise UnknownSessionError(session_id)
-        user_id, expires_at, last_check, terminated_at = record
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+        ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
-        self._sessions[session_id] = (user_id, expires_at, now, terminated_at)
         if terminated_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, terminated_at,
+                idle_timeout, last_activity, idle_expired,
+            )
             return ("denied", "session_terminated", user_id)
+        if idle_expired:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return ("denied", "session_idle_expired", user_id)
         if now >= expires_at:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False,
+            )
             return ("denied", "session_expired", user_id)
+        if self._idle_expired_now(idle_timeout, last_activity, now):
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return ("denied", "session_idle_expired", user_id)
+        # 会话仍有效：提交检查时间并刷新最近活动时间。
+        self._sessions[session_id] = (
+            user_id, expires_at, now, None, idle_timeout, now, False,
+        )
         policy = self._admission_policies.get(user_id)
         if policy is None:
             return ("denied", "policy_not_configured", user_id)
@@ -368,22 +466,58 @@ class UserRegistry:
         返回 (status, reason, user_id, expires_at) 并提交本次检查时间：
         now 早于该会话最近已提交的检查时间时抛出 SessionTimeRegressionError，
         状态不变（相等时间允许重复检查）；已终止的会话一律返回
-        denied/session_terminated；否则 now < expires_at 返回 accepted，
-        now >= expires_at 返回 denied/session_expired，过期为终态，过期时刻
-        不被刷新，用户认证状态不被触碰。未知会话抛出 UnknownSessionError。
+        denied/session_terminated；已处于空闲过期终态的会话一律返回
+        denied/session_idle_expired；否则先判断硬期限：now >= expires_at
+        返回 denied/session_expired，过期为终态，过期时刻不被刷新；
+        再判断启用了空闲超时的会话 now >= last_activity + idle_timeout，
+        命中则置空闲过期终态并返回 denied/session_idle_expired；
+        否则返回 accepted 并以本次 now 刷新最近活动时间。异常、时间回退、
+        硬过期与空闲过期均不刷新活动时间；用户认证状态不被触碰。
+        未知会话抛出 UnknownSessionError。
         """
         record = self._sessions.get(session_id)
         if record is None:
             raise UnknownSessionError(session_id)
-        user_id, expires_at, last_check, terminated_at = record
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+        ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
-        self._sessions[session_id] = (user_id, expires_at, now, terminated_at)
         if terminated_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, terminated_at,
+                idle_timeout, last_activity, idle_expired,
+            )
             return ("denied", "session_terminated", user_id, expires_at)
-        if now < expires_at:
-            return ("accepted", None, user_id, expires_at)
-        return ("denied", "session_expired", user_id, expires_at)
+        if idle_expired:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return ("denied", "session_idle_expired", user_id, expires_at)
+        if now >= expires_at:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False,
+            )
+            return ("denied", "session_expired", user_id, expires_at)
+        if self._idle_expired_now(idle_timeout, last_activity, now):
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return ("denied", "session_idle_expired", user_id, expires_at)
+        # 会话仍有效：提交检查时间并刷新最近活动时间。
+        self._sessions[session_id] = (
+            user_id, expires_at, now, None, idle_timeout, now, False,
+        )
+        return ("accepted", None, user_id, expires_at)
 
     def terminate_session(self, session_id, now):
         """按注入时间主动终止有效会话。
@@ -392,29 +526,60 @@ class UserRegistry:
         时间：now 早于该会话最近已提交的时间时抛出
         SessionTimeRegressionError，状态不变（相等时间允许重复调用）；
         已终止的会话幂等返回首次 terminated_at，不改写终止时间；
-        now >= expires_at 时会话保持过期终态，返回 denied/session_expired、
-        terminated_at 为 null，不留下终止标记；否则记录 terminated_at=now
-        并返回 terminated。终止不改变用户失败计数、锁定状态或其他会话。
+        已处于空闲过期终态的会话返回 denied/session_idle_expired 且
+        terminated_at 为 null；now >= expires_at 时会话保持过期终态，返回
+        denied/session_expired、terminated_at 为 null，不留下终止标记；
+        启用了空闲超时的会话 now >= last_activity + idle_timeout 时置空闲
+        过期终态，返回 denied/session_idle_expired、terminated_at 为 null；
+        否则记录 terminated_at=now 并返回 terminated。终止不刷新活动时间，
+        不改变用户失败计数、锁定状态或其他会话。
         未知会话抛出 UnknownSessionError。
         """
         record = self._sessions.get(session_id)
         if record is None:
             raise UnknownSessionError(session_id)
-        user_id, expires_at, last_check, terminated_at = record
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+        ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
         if terminated_at is not None:
             self._sessions[session_id] = (
-                user_id,
-                expires_at,
-                now,
-                terminated_at,
+                user_id, expires_at, now, terminated_at,
+                idle_timeout, last_activity, idle_expired,
             )
             return ("terminated", None, user_id, terminated_at, expires_at)
+        if idle_expired:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return (
+                "denied", "session_idle_expired", user_id, None, expires_at,
+            )
         if now >= expires_at:
-            self._sessions[session_id] = (user_id, expires_at, now, None)
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False,
+            )
             return ("denied", "session_expired", user_id, None, expires_at)
-        self._sessions[session_id] = (user_id, expires_at, now, now)
+        if self._idle_expired_now(idle_timeout, last_activity, now):
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return (
+                "denied", "session_idle_expired", user_id, None, expires_at,
+            )
+        self._sessions[session_id] = (
+            user_id, expires_at, now, now, idle_timeout, last_activity, False,
+        )
         return ("terminated", None, user_id, now, expires_at)
 
 
@@ -523,7 +688,8 @@ def _validate_operation(index, operation):
             "field 'operation' must be 'register', 'authenticate', "
             "'authenticate_stateful', 'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
-            "'set_admission_policy' or 'check_admission'",
+            "'set_admission_policy', 'check_admission' or "
+            "'set_session_idle_timeout'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -548,6 +714,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_SET_SESSION_LIMIT,
         _OPERATION_SET_ADMISSION_POLICY,
+        _OPERATION_SET_SESSION_IDLE_TIMEOUT,
     )
     if needs_user:
         user_id = _validate_string_field(operation, "user_id", index)
@@ -670,6 +837,20 @@ def _validate_operation(index, operation):
                 EXIT_VALUE_ERROR,
             )
         validated["max_sessions"] = max_sessions
+
+    if kind == _OPERATION_SET_SESSION_IDLE_TIMEOUT:
+        idle_timeout = _validate_integer_field(
+            operation, "idle_timeout", index
+        )
+        if not (IDLE_TIMEOUT_MIN <= idle_timeout <= IDLE_TIMEOUT_MAX):
+            raise BatchError(
+                "value_error",
+                index,
+                "idle_timeout must be %d..%d, got %d"
+                % (IDLE_TIMEOUT_MIN, IDLE_TIMEOUT_MAX, idle_timeout),
+                EXIT_VALUE_ERROR,
+            )
+        validated["idle_timeout"] = idle_timeout
 
     if kind == _OPERATION_SET_ADMISSION_POLICY:
         rules = operation.get("rules")
@@ -941,6 +1122,27 @@ def run_batch(registry, operations):
                     "rule_count": len(op["rules"]),
                 }
             )
+        elif kind == _OPERATION_SET_SESSION_IDLE_TIMEOUT:
+            user_id = op["user_id"]
+            try:
+                working.set_session_idle_timeout(
+                    user_id, op["idle_timeout"]
+                )
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_SET_SESSION_IDLE_TIMEOUT,
+                    "user_id": user_id,
+                    "status": "configured",
+                    "idle_timeout": op["idle_timeout"],
+                }
+            )
         elif kind == _OPERATION_CHECK_ADMISSION:
             session_id = op["session_id"]
             try:
@@ -1010,6 +1212,7 @@ def run_batch(registry, operations):
     registry._sessions = working._sessions
     registry._session_limits = working._session_limits
     registry._admission_policies = working._admission_policies
+    registry._idle_timeouts = working._idle_timeouts
     return results
 
 
@@ -1088,7 +1291,8 @@ def _build_parser():
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
             "authenticate_session / validate_session / terminate_session /\n"
-            "set_session_limit / set_admission_policy / check_admission 操作，\n"
+            "set_session_limit / set_admission_policy / check_admission /\n"
+            "set_session_idle_timeout 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -1106,6 +1310,8 @@ def _build_parser():
             "  lifetime (仅 authenticate_session): 1..86400 的 JSON 整数秒，\n"
             "  且 now+lifetime 不得超过 9007199254740991。\n"
             "  max_sessions (仅 set_session_limit): 0..64 的 JSON 整数。\n"
+            "  idle_timeout (仅 set_session_idle_timeout): 0..86400 的 JSON 整数秒，\n"
+            "  0 表示关闭空闲超时。\n"
             "  port_id (准入操作): 字符串，1..64 个 Unicode 码点，不含控制字符。\n"
             "  vlan_id (准入操作): 1..4094 的 JSON 整数。\n"
             "  rules (仅 set_admission_policy): 最多 64 项的 JSON 数组，每项为仅含\n"
@@ -1130,23 +1336,36 @@ def _build_parser():
             "  expires_at 的会话计入并发（已过期会话保留记录但不计入）；\n"
             "  活动数达到上限时返回 denied/session_limit_reached、expires_at\n"
             "  为 null，不创建会话，正确口令清零失败计数的效果仍提交。\n"
+            "  已达到空闲期限的会话不计入并发，计数不刷新活动时间。创建会话时\n"
+            "  快照该用户当前的空闲超时配置（未配置或 0 表示关闭），并以创建\n"
+            "  now 作为首次活动时间；lifetime 仍是不可延长的硬期限。\n"
             "  结果键序为 operation、user_id、session_id、status、reason、\n"
             "  expires_at。\n"
             "validate_session:\n"
             "  now 早于该会话最近已提交的检查时间时整批 state_error（状态不变，\n"
             "  相等时间允许重复检查）；已终止的会话一律返回\n"
-            "  denied/session_terminated；否则 now 小于 expires_at 返回 accepted，\n"
-            "  达到或超过返回 denied/session_expired，过期为终态，不刷新过期\n"
-            "  时刻，也不改变用户认证状态。未知 session_id 整批 unknown_session。\n"
+            "  denied/session_terminated；已处于空闲过期终态的会话一律返回\n"
+            "  denied/session_idle_expired；否则先判断硬期限：now 达到或超过\n"
+            "  expires_at 返回 denied/session_expired，过期为终态，不刷新过期\n"
+            "  时刻；再判断启用了空闲超时的会话 now 是否达到\n"
+            "  最近活动时间+idle_timeout，命中则置空闲过期终态并返回\n"
+            "  denied/session_idle_expired；否则返回 accepted 并以本次 now\n"
+            "  刷新最近活动时间。异常、时间回退、硬过期与空闲过期均不刷新\n"
+            "  活动时间，也不改变用户认证状态。未知 session_id 整批\n"
+            "  unknown_session。\n"
             "  结果键序为 operation、session_id、user_id、status、reason、\n"
             "  expires_at。会话仅驻留当前进程。\n"
             "terminate_session:\n"
             "  主动终止有效会话，字段与校验规则同 validate_session。\n"
             "  now 早于该会话最近已提交的时间时整批 state_error（状态不变，\n"
             "  相等时间允许重复调用）；已终止的会话幂等返回首次 terminated_at；\n"
-            "  now 达到或超过 expires_at 时会话保持过期终态，返回\n"
-            "  denied/session_expired 且 terminated_at 为 null；否则记录\n"
-            "  terminated_at=now 并返回 terminated、reason 为 null。\n"
+            "  已处于空闲过期终态的会话返回 denied/session_idle_expired 且\n"
+            "  terminated_at 为 null；now 达到或超过 expires_at 时会话保持过期\n"
+            "  终态，返回 denied/session_expired 且 terminated_at 为 null；\n"
+            "  启用了空闲超时的会话 now 达到 最近活动时间+idle_timeout 时置空闲\n"
+            "  过期终态，返回 denied/session_idle_expired 且 terminated_at 为\n"
+            "  null；否则记录 terminated_at=now 并返回 terminated、reason 为 null。\n"
+            "  终止不刷新活动时间。\n"
             "  终止不改变用户失败计数、锁定状态或其他会话；未知 session_id\n"
             "  整批 unknown_session。结果键序为 operation、session_id、user_id、\n"
             "  status、reason、terminated_at、expires_at。\n"
@@ -1175,16 +1394,36 @@ def _build_parser():
             "  单调语义同 validate_session：now 早于该会话最近已提交的检查时间\n"
             "  整批 state_error（状态不变，相等时间允许重复检查）；未知\n"
             "  session_id 整批 unknown_session。已终止的会话返回\n"
-            "  denied/session_terminated；已过期的会话返回 denied/session_expired；\n"
-            "  活动会话按所属用户策略精确匹配 (port_id, vlan_id)：命中返回\n"
+            "  denied/session_terminated；已处于空闲过期终态的会话返回\n"
+            "  denied/session_idle_expired；已过期的会话返回 denied/session_expired；\n"
+            "  启用了空闲超时的会话 now 达到 最近活动时间+idle_timeout 时置空闲\n"
+            "  过期终态并返回 denied/session_idle_expired；仍有效的会话按所属\n"
+            "  用户策略精确匹配 (port_id, vlan_id)：命中返回\n"
             "  accepted 且 reason 为 null；未配置策略返回\n"
             "  denied/policy_not_configured；空策略或未命中返回\n"
-            "  denied/policy_denied。正常判定均提交本次会话检查时间，异常则整批\n"
+            "  denied/policy_denied。对仍有效会话的判定（含策略拒绝）以本次 now\n"
+            "  刷新最近活动时间；异常、时间回退、硬过期与空闲过期均不刷新。\n"
+            "  正常判定均提交本次会话检查时间，异常则整批\n"
             "  回滚。结果键序为 operation、session_id、user_id、port_id、\n"
             "  vlan_id、status、reason。\n"
+            "set_session_idle_timeout:\n"
+            "  为已登记用户设置会话空闲超时，接收 user_id 与 idle_timeout\n"
+            "  （0..86400 的 JSON 整数秒，0 表示关闭；未配置等同关闭）。重复设置\n"
+            "  相同值幂等，新值覆盖旧值但只作用于此后创建的会话，已有会话沿用\n"
+            "  创建时快照的配置。启用后，新会话以创建 now 作为首次活动时间；\n"
+            "  validate_session 与 check_admission 对仍有效会话完成判定后以本次\n"
+            "  now 刷新最近活动时间（策略拒绝也算活动）；异常、时间回退、硬过期、\n"
+            "  空闲过期与整批失败均不刷新。三个会话入口保留主动终止或空闲过期\n"
+            "  终态，否则先判断 now 是否达到 expires_at（不可延长的硬期限），再\n"
+            "  判断是否达到 最近活动时间+idle_timeout；命中空闲期限返回\n"
+            "  denied/session_idle_expired 并成为不可恢复终态，terminate_session\n"
+            "  也返回该原因且 terminated_at 为 null。并发计数排除已达到空闲期限\n"
+            "  的会话且不刷新活动时间。引用未知用户整批 unknown_user。结果键序为\n"
+            "  operation、user_id、status、idle_timeout，status 为 configured。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
-            "      session_expired、session_terminated、session_limit_reached、\n"
+            "      session_expired、session_idle_expired、session_terminated、\n"
+            "      session_limit_reached、\n"
             "      policy_not_configured、policy_denied 与终止结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
             "  3  value_error：长度、salt 编码、now/lifetime 范围、规则数量、\n"

@@ -53,6 +53,7 @@
   * 已终止的会话一律 denied/session_terminated；否则 `now < expires_at`：
     accepted；`now >= expires_at`：denied/session_expired，过期为终态。
     检查不刷新过期时刻，也不改变用户认证状态，时间只取自输入。
+    用户配置空闲超时后的判定与活动刷新语义见 `set_session_idle_timeout`。
   * 未知 session_id 整批 `unknown_session`（退出码 8）。
   * 结果键序固定为 operation、session_id、user_id、status、reason、expires_at。
 * `terminate_session`：按注入时间主动终止有效会话，接收 session_id、`now`，
@@ -98,11 +99,28 @@
     `unknown_session`（退出码 8），时间回退整批 `state_error`（退出码 6）。
   * 结果键序固定为 operation、session_id、user_id、port_id、vlan_id、
     status、reason。
+* `set_session_idle_timeout`：为已登记用户设置会话空闲超时，接收 user_id、
+  `idle_timeout`（0..86400 的 JSON 整数秒；0 或未配置表示关闭）。
+  * 重复设置相同值幂等，新值覆盖旧值但只作用于此后创建的会话，已有会话
+    沿用创建时快照的配置；`lifetime` 仍是不可延长的硬期限。
+  * 启用后，新会话以创建时的 `now` 作为首次活动时间；`validate_session` 与
+    `check_admission` 对仍有效的会话完成判定后以本次 `now` 刷新最近活动时间
+    （策略拒绝也算活动）；异常、时间回退、硬过期、空闲过期与整批失败均不刷新。
+  * 三个会话入口保留主动终止或空闲过期终态，否则先判断 `now` 是否达到
+    `expires_at`，再判断是否达到 最近活动时间+`idle_timeout`；命中空闲期限
+    返回 denied/session_idle_expired 并成为不可恢复终态：此后两个检查入口
+    始终返回该原因，`terminate_session` 也返回该原因且 terminated_at 为 null。
+  * 并发计数排除已达到空闲期限的会话，且不刷新活动时间；未到期限时保留
+    原有准入、校验和终止语义。
+  * 引用未知用户整批 `unknown_user`（退出码 5）。
+  * 结果键序固定为 operation、user_id、status、idle_timeout，status 为
+    configured。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额与准入策略恢复到批次开始前，普通拒绝、会话过期与会话终止作为成功结果提交。未知用户报
+会话、并发限额、准入策略与空闲超时配置恢复到批次开始前，普通拒绝、会话过期、
+空闲过期与会话终止作为成功结果提交。未知用户报
 `unknown_user`（退出码 5）。字段缺失、类型错误或多余字段报
 `parameter_error`（退出码 2），范围错误报 `value_error`（退出码 3）。
 详细字段限制与退出码见 `python access_auth.py --help`。
