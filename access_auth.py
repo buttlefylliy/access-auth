@@ -5,7 +5,8 @@
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
 authenticate_stateful / authenticate_session / validate_session /
 terminate_session / set_session_limit / set_admission_policy /
-set_admission_default / check_admission / set_session_idle_timeout 操作，
+set_admission_default / check_admission / set_session_idle_timeout /
+list_authentication_events 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -69,6 +70,7 @@ _OPERATION_SET_ADMISSION_POLICY = "set_admission_policy"
 _OPERATION_SET_ADMISSION_DEFAULT = "set_admission_default"
 _OPERATION_CHECK_ADMISSION = "check_admission"
 _OPERATION_SET_SESSION_IDLE_TIMEOUT = "set_session_idle_timeout"
+_OPERATION_LIST_AUTHENTICATION_EVENTS = "list_authentication_events"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -122,6 +124,10 @@ _REQUIRED_KEYS = {
         "operation",
         "user_id",
         "idle_timeout",
+    ),
+    _OPERATION_LIST_AUTHENTICATION_EVENTS: (
+        "operation",
+        "user_id",
     ),
 }
 
@@ -220,6 +226,13 @@ class UserRegistry:
     另维护每用户空闲超时 _idle_timeouts（user_id -> int，秒）；
     未配置或配置为 0 均表示关闭空闲超时。配置只在创建会话时快照进会话
     记录，已有会话沿用创建时的配置；lifetime 仍是不可延长的硬期限。
+
+    另维护每用户认证事件轨迹 _auth_events
+    （user_id -> list[(source, now, status, reason, session_id)]），
+    仅记录已作为普通结果提交的 authenticate_stateful 与
+    authenticate_session 尝试；无状态 authenticate 不产生事件。每个用户的
+    事件按提交顺序从 1 连续编号，事件不含口令、盐、编码凭据或摘要。轨迹随
+    整批副本一起提交或回滚；只读查询 list_authentication_events 不追加事件。
     """
 
     def __init__(self):
@@ -230,6 +243,7 @@ class UserRegistry:
         self._admission_policies = {}
         self._admission_defaults = {}
         self._idle_timeouts = {}
+        self._auth_events = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -243,7 +257,30 @@ class UserRegistry:
         clone._admission_policies = dict(self._admission_policies)
         clone._admission_defaults = dict(self._admission_defaults)
         clone._idle_timeouts = dict(self._idle_timeouts)
+        clone._auth_events = {
+            user_id: list(events)
+            for user_id, events in self._auth_events.items()
+        }
         return clone
+
+    def append_authentication_event(
+        self, user_id, source, now, status, reason, session_id
+    ):
+        """为用户追加一条已提交的认证事件（按调用顺序连续编号）。"""
+        self._auth_events.setdefault(user_id, []).append(
+            (source, now, status, reason, session_id)
+        )
+
+    def list_authentication_events(self, user_id):
+        """返回该用户认证轨迹的只读副本（按提交顺序）。
+
+        轨迹中的每条记录为
+        (source, now, status, reason, session_id)，编号由调用方按
+        1 起始的位置派生。不修改任何状态。未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        return list(self._auth_events.get(user_id, ()))
 
     def register(self, user_id, password, salt):
         """登记用户；salt 为 16 字节。重复登记抛出 DuplicateUserError。"""
@@ -719,8 +756,8 @@ def _validate_operation(index, operation):
             "'authenticate_stateful', 'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
-            "'check_admission' or "
-            "'set_session_idle_timeout'",
+            "'check_admission', 'set_session_idle_timeout' or "
+            "'list_authentication_events'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -747,6 +784,7 @@ def _validate_operation(index, operation):
         _OPERATION_SET_ADMISSION_POLICY,
         _OPERATION_SET_ADMISSION_DEFAULT,
         _OPERATION_SET_SESSION_IDLE_TIMEOUT,
+        _OPERATION_LIST_AUTHENTICATION_EVENTS,
     )
     if needs_user:
         user_id = _validate_string_field(operation, "user_id", index)
@@ -1056,6 +1094,14 @@ def run_batch(registry, operations):
                     "locked_until": locked_until,
                 }
             )
+            working.append_authentication_event(
+                user_id,
+                _OPERATION_AUTHENTICATE_STATEFUL,
+                op["now"],
+                status,
+                reason,
+                None,
+            )
         elif kind == _OPERATION_AUTHENTICATE_SESSION:
             user_id = op["user_id"]
             session_id = op["session_id"]
@@ -1098,6 +1144,16 @@ def run_batch(registry, operations):
                     "reason": reason,
                     "expires_at": expires_at,
                 }
+            )
+            # 接受、口令拒绝、锁定与达到并发上限都记录请求中的 session_id；
+            # 重复 session_id 在上方作为整批异常抛出，不会到达这里。
+            working.append_authentication_event(
+                user_id,
+                _OPERATION_AUTHENTICATE_SESSION,
+                op["now"],
+                status,
+                reason,
+                session_id,
             )
         elif kind == _OPERATION_VALIDATE_SESSION:
             session_id = op["session_id"]
@@ -1240,6 +1296,44 @@ def run_batch(registry, operations):
                     "reason": reason,
                 }
             )
+        elif kind == _OPERATION_LIST_AUTHENTICATION_EVENTS:
+            user_id = op["user_id"]
+            try:
+                events = working.list_authentication_events(user_id)
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            # 只读：不推进任何时间、不改变状态、不追加事件；在副本上查询
+            # 即可反映本批先前已提交的事件，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_LIST_AUTHENTICATION_EVENTS,
+                    "user_id": user_id,
+                    "status": "reported",
+                    "event_count": len(events),
+                    "events": [
+                        {
+                            "sequence": sequence,
+                            "source": source,
+                            "now": now,
+                            "status": status,
+                            "reason": reason,
+                            "session_id": session_id,
+                        }
+                        for sequence, (
+                            source,
+                            now,
+                            status,
+                            reason,
+                            session_id,
+                        ) in enumerate(events, start=1)
+                    ],
+                }
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -1279,6 +1373,7 @@ def run_batch(registry, operations):
     registry._admission_policies = working._admission_policies
     registry._admission_defaults = working._admission_defaults
     registry._idle_timeouts = working._idle_timeouts
+    registry._auth_events = working._auth_events
     return results
 
 
@@ -1358,7 +1453,8 @@ def _build_parser():
             "register / authenticate / authenticate_stateful /\n"
             "authenticate_session / validate_session / terminate_session /\n"
             "set_session_limit / set_admission_policy / set_admission_default /\n"
-            "check_admission / set_session_idle_timeout 操作，\n"
+            "check_admission / set_session_idle_timeout /\n"
+            "list_authentication_events 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -1501,6 +1597,22 @@ def _build_parser():
             "  也返回该原因且 terminated_at 为 null。并发计数排除已达到空闲期限\n"
             "  的会话且不刷新活动时间。引用未知用户整批 unknown_user。结果键序为\n"
             "  operation、user_id、status、idle_timeout，status 为 configured。\n"
+            "list_authentication_events:\n"
+            "  为已登记用户返回本进程当前批次内已提交的认证轨迹，仅接收\n"
+            "  operation 与 user_id。轨迹只覆盖 authenticate_stateful 与\n"
+            "  authenticate_session（无状态 authenticate 不产生事件），每个有状态\n"
+            "  认证操作在得到普通业务结果（接受、口令拒绝、锁定、并发上限）后\n"
+            "  至多追加一条；导致整批失败的异常（时间回退、重复 session_id、\n"
+            "  未知用户等）不留下事件，批次后续失败时先前新增事件一并回滚。\n"
+            "  事件按该用户提交顺序从 1 连续编号，键序为 sequence、source、now、\n"
+            "  status、reason、session_id；source 为触发操作名，now 为显式输入值，\n"
+            "  status 与 reason 等于该操作的对外结果，authenticate_stateful 的\n"
+            "  session_id 为 null，authenticate_session 一律记录请求中的\n"
+            "  session_id。查询为只读：重复查询返回逐字节相同内容，不推进认证\n"
+            "  时间、会话检查时间或活动时间，也不生成事件；无事件时返回空数组\n"
+            "  和 0。事件不含口令、盐、编码凭据或摘要。引用未知用户整批\n"
+            "  unknown_user。结果键序为 operation、user_id、status、event_count、\n"
+            "  events，status 为 reported。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
