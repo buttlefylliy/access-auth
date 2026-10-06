@@ -33,8 +33,31 @@
     `state_error`（退出码 6）。
   * 结果键序固定为 operation、user_id、status、reason、failed_attempts、
     locked_until；成功时 reason 为 null，未锁定时 locked_until 为 null。
+* `authenticate_session`：通过有状态认证创建确定性会话。接收 user_id、
+  password、session_id、now、lifetime（1..86400 的 JSON 整数，
+  且 now+lifetime 不得超过 9007199254740991）。沿用 authenticate_stateful
+  的全部凭据校验、用户时间单调性、失败计数与锁定语义并提交用户状态。
+  * 认证被拒绝（invalid_password/account_locked）时不创建会话，
+    返回 session_id 与 `expires_at: null`。
+  * 成功时在当前进程内存中创建会话，`expires_at` 为 now+lifetime。
+  * session_id 为 1..64 个无控制字符的 Unicode 码点；重复 session_id 报
+    `duplicate_session`（退出码 7）。
+  * 结果键序固定为 operation、user_id、session_id、status、reason、
+    expires_at；成功时 reason 为 null。
+* `validate_session`：按注入时间校验会话，接收 session_id、now。
+  * 会话保存最近一次已提交的检查时间；now 早于该值时报 `state_error`
+    （退出码 6），状态不变；相等时间允许重复检查。
+  * now 小于 expires_at 时返回 accepted；达到或超过时返回
+    denied/`session_expired`，过期成为终态（记录保留）。
+  * 检查不刷新过期时刻，也不改变任何用户认证状态；时间只取自输入。
+  * 未知 session_id 报 `unknown_session`（退出码 8）。
+  * 结果键序固定为 operation、session_id、user_id、status、reason、
+    expires_at；成功时 reason 为 null。
 
-整批操作先全部校验，再在注册表副本上依序执行；任一异常则凭据与认证状态
-恢复到批次开始前，普通拒绝属于成功执行并提交状态。未知用户报
-`unknown_user`（退出码 5）。详细字段限制与退出码见
-`python access_auth.py --help`。
+会话仅驻留当前进程内存、不落盘，其数量不超过本批成功创建的会话数；
+单操作按 user_id/session_id 直接定位，不扫描全部用户或会话。
+
+整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、
+认证状态与会话全部恢复到批次开始前，普通拒绝（含会话过期）属于成功
+执行并提交状态。未知用户报 `unknown_user`（退出码 5）。详细字段限制
+与退出码见 `python access_auth.py --help`。

@@ -3,7 +3,8 @@
 
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
-authenticate_stateful 操作，并向标准输出写入紧凑 JSON 结果。
+authenticate_stateful / authenticate_session / validate_session 操作，并向
+标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
 
@@ -27,11 +28,17 @@ USER_ID_MIN_LENGTH = 1
 USER_ID_MAX_LENGTH = 64
 PASSWORD_MIN_BYTES = 8
 PASSWORD_MAX_BYTES = 128
+SESSION_ID_MIN_LENGTH = 1
+SESSION_ID_MAX_LENGTH = 64
 
 # authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与锁定时长。
 MAX_NOW = 9007199254740991
 LOCK_DURATION_SECONDS = 300
 MAX_FAILED_ATTEMPTS = 3
+
+# authenticate_session：会话有效期（秒）范围。
+LIFETIME_MIN = 1
+LIFETIME_MAX = 86400
 
 EXIT_OK = 0
 EXIT_PARAMETER_ERROR = 2
@@ -39,10 +46,14 @@ EXIT_VALUE_ERROR = 3
 EXIT_DUPLICATE_USER = 4
 EXIT_UNKNOWN_USER = 5
 EXIT_STATE_ERROR = 6
+EXIT_DUPLICATE_SESSION = 7
+EXIT_UNKNOWN_SESSION = 8
 
 _OPERATION_REGISTER = "register"
 _OPERATION_AUTHENTICATE = "authenticate"
 _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
+_OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
+_OPERATION_VALIDATE_SESSION = "validate_session"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -52,6 +63,15 @@ _REQUIRED_KEYS = {
         "password",
         "now",
     ),
+    _OPERATION_AUTHENTICATE_SESSION: (
+        "operation",
+        "user_id",
+        "password",
+        "session_id",
+        "now",
+        "lifetime",
+    ),
+    _OPERATION_VALIDATE_SESSION: ("operation", "session_id", "now"),
 }
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -86,6 +106,24 @@ class StateRegressionError(Exception):
         self.last_now = last_now
 
 
+class DuplicateSessionError(Exception):
+    """authenticate_session 使用了已存在的 session_id。"""
+
+
+class UnknownSessionError(Exception):
+    """validate_session 引用了不存在的会话。"""
+
+
+class SessionRegressionError(Exception):
+    """validate_session 的 now 早于该会话上次已提交的检查时间。"""
+
+    def __init__(self, session_id, now, last_now):
+        super().__init__(session_id)
+        self.session_id = session_id
+        self.now = now
+        self.last_now = last_now
+
+
 def encode_credential(password, salt):
     """按 pbkdf2_sha256$200000$盐十六进制$摘要十六进制 编码凭据。"""
     digest = hashlib.pbkdf2_hmac(
@@ -100,11 +138,16 @@ class UserRegistry:
     另为 authenticate_stateful 维护每用户的认证状态
     (last_now, failed_attempts, locked_until)，值为不可变元组，
     不保留认证历史。
+
+    会话表 session_id -> (user_id, expires_at, last_check) 仅驻留内存：
+    expires_at 为创建时的 now+lifetime，last_check 为最近一次已提交的
+    authenticate_session / validate_session 时间；过期是终态，记录保留。
     """
 
     def __init__(self):
         self._credentials = {}
         self._states = {}
+        self._sessions = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -113,6 +156,7 @@ class UserRegistry:
         clone = UserRegistry()
         clone._credentials = dict(self._credentials)
         clone._states = dict(self._states)
+        clone._sessions = dict(self._sessions)
         return clone
 
     def register(self, user_id, password, salt):
@@ -173,6 +217,46 @@ class UserRegistry:
         self._states[user_id] = (now, failed_attempts, locked_until)
         return ("denied", "invalid_password", failed_attempts, locked_until)
 
+    def authenticate_session(self, user_id, password, session_id, now, lifetime):
+        """通过有状态认证创建确定性会话。
+
+        沿用 authenticate_stateful 的全部凭据校验、时间单调性、失败计数与
+        锁定语义并提交用户状态。认证被拒绝时不创建会话，返回
+        (status, reason, None)；认证通过且 session_id 未占用时创建会话，
+        过期时刻为 now+lifetime，返回 ("accepted", None, expires_at)。
+        session_id 已存在时抛出 DuplicateSessionError（整批回滚）。
+        """
+        status, reason, _failed_attempts, _locked_until = (
+            self.authenticate_stateful(user_id, password, now)
+        )
+        if status != "accepted":
+            return (status, reason, None)
+        if session_id in self._sessions:
+            raise DuplicateSessionError(session_id)
+        expires_at = now + lifetime
+        self._sessions[session_id] = (user_id, expires_at, now)
+        return ("accepted", None, expires_at)
+
+    def validate_session(self, session_id, now):
+        """按注入时间校验会话，不刷新过期时刻。
+
+        返回 (status, reason, user_id, expires_at) 并提交最近检查时间。
+        未知会话抛出 UnknownSessionError；now 早于该会话上次已提交检查
+        时间时抛出 SessionRegressionError，状态不变（相等合法）。
+        now 小于 expires_at 时 accepted；达到或超过时
+        denied/session_expired，过期为终态；不改变任何用户认证状态。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        user_id, expires_at, last_check = record
+        if now < last_check:
+            raise SessionRegressionError(session_id, now, last_check)
+        self._sessions[session_id] = (user_id, expires_at, now)
+        if now < expires_at:
+            return ("accepted", None, user_id, expires_at)
+        return ("denied", "session_expired", user_id, expires_at)
+
 
 def _is_control_free(value):
     return all(unicodedata.category(ch) != "Cc" for ch in value)
@@ -185,19 +269,6 @@ def _validate_string_field(operation, key, index):
             "parameter_error",
             index,
             "field %r must be a string" % key,
-            EXIT_PARAMETER_ERROR,
-        )
-    return value
-
-
-def _validate_now_type(index, operation):
-    """校验 authenticate_stateful 的 now 字段类型，返回整数值。"""
-    value = operation.get("now")
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise BatchError(
-            "parameter_error",
-            index,
-            "field 'now' must be a JSON integer",
             EXIT_PARAMETER_ERROR,
         )
     return value
@@ -222,8 +293,43 @@ def _validate_now_range(index, now):
         )
 
 
+def _validate_integer_field(operation, key, index):
+    """校验字段为非布尔 JSON 整数，返回整数值。"""
+    value = operation.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BatchError(
+            "parameter_error",
+            index,
+            "field %r must be a JSON integer" % key,
+            EXIT_PARAMETER_ERROR,
+        )
+    return value
+
+
+def _validate_identifier(operation, key, index):
+    """校验 user_id / session_id：1..64 个无控制字符的 Unicode 码点。"""
+    value = _validate_string_field(operation, key, index)
+    if not (USER_ID_MIN_LENGTH <= len(value) <= USER_ID_MAX_LENGTH):
+        raise BatchError(
+            "value_error",
+            index,
+            "%s must be %d..%d Unicode code points, got %d"
+            % (key, USER_ID_MIN_LENGTH, USER_ID_MAX_LENGTH, len(value)),
+            EXIT_VALUE_ERROR,
+        )
+    if not _is_control_free(value):
+        raise BatchError(
+            "value_error",
+            index,
+            "%s must not contain control characters" % key,
+            EXIT_VALUE_ERROR,
+        )
+    return value
+
+
 def _validate_operation(index, operation):
-    """校验单个操作，返回 (kind, user_id, password, salt, now)。"""
+    """校验单个操作，返回 (kind, user_id, password, salt, now,
+    session_id, lifetime)，未出现的字段为 None。"""
     if not isinstance(operation, dict):
         raise BatchError(
             "parameter_error",
@@ -236,8 +342,9 @@ def _validate_operation(index, operation):
         raise BatchError(
             "parameter_error",
             index,
-            "field 'operation' must be 'register', 'authenticate' "
-            "or 'authenticate_stateful'",
+            "field 'operation' must be 'register', 'authenticate', "
+            "'authenticate_stateful', 'authenticate_session' or "
+            "'validate_session'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -254,39 +361,38 @@ def _validate_operation(index, operation):
             "parameter_error", index, "; ".join(parts), EXIT_PARAMETER_ERROR
         )
 
-    user_id = _validate_string_field(operation, "user_id", index)
-    password = _validate_string_field(operation, "password", index)
+    user_id = None
+    password = None
     salt = None
-    if kind == _OPERATION_REGISTER:
-        salt = _validate_string_field(operation, "salt", index)
     now = None
-    if kind == _OPERATION_AUTHENTICATE_STATEFUL:
-        now = _validate_now_type(index, operation)
+    session_id = None
+    lifetime = None
+    if kind == _OPERATION_VALIDATE_SESSION:
+        session_id = _validate_identifier(operation, "session_id", index)
+        now = _validate_integer_field(operation, "now", index)
+    else:
+        user_id = _validate_identifier(operation, "user_id", index)
+        password = _validate_string_field(operation, "password", index)
+        if kind == _OPERATION_REGISTER:
+            salt = _validate_string_field(operation, "salt", index)
+        if kind == _OPERATION_AUTHENTICATE_STATEFUL:
+            now = _validate_integer_field(operation, "now", index)
+        if kind == _OPERATION_AUTHENTICATE_SESSION:
+            session_id = _validate_identifier(operation, "session_id", index)
+            now = _validate_integer_field(operation, "now", index)
+            lifetime = _validate_integer_field(operation, "lifetime", index)
 
-    if not (USER_ID_MIN_LENGTH <= len(user_id) <= USER_ID_MAX_LENGTH):
-        raise BatchError(
-            "value_error",
-            index,
-            "user_id must be %d..%d Unicode code points, got %d"
-            % (USER_ID_MIN_LENGTH, USER_ID_MAX_LENGTH, len(user_id)),
-            EXIT_VALUE_ERROR,
-        )
-    if not _is_control_free(user_id):
-        raise BatchError(
-            "value_error",
-            index,
-            "user_id must not contain control characters",
-            EXIT_VALUE_ERROR,
-        )
-    password_bytes = len(password.encode("utf-8"))
-    if not (PASSWORD_MIN_BYTES <= password_bytes <= PASSWORD_MAX_BYTES):
-        raise BatchError(
-            "value_error",
-            index,
-            "password must be %d..%d bytes in UTF-8, got %d"
-            % (PASSWORD_MIN_BYTES, PASSWORD_MAX_BYTES, password_bytes),
-            EXIT_VALUE_ERROR,
-        )
+    password_bytes = None
+    if password is not None:
+        password_bytes = len(password.encode("utf-8"))
+        if not (PASSWORD_MIN_BYTES <= password_bytes <= PASSWORD_MAX_BYTES):
+            raise BatchError(
+                "value_error",
+                index,
+                "password must be %d..%d bytes in UTF-8, got %d"
+                % (PASSWORD_MIN_BYTES, PASSWORD_MAX_BYTES, password_bytes),
+                EXIT_VALUE_ERROR,
+            )
     salt_bytes = None
     if kind == _OPERATION_REGISTER:
         if len(salt) != SALT_HEX_LENGTH or any(
@@ -300,9 +406,36 @@ def _validate_operation(index, operation):
                 EXIT_VALUE_ERROR,
             )
         salt_bytes = bytes.fromhex(salt)
-    if kind == _OPERATION_AUTHENTICATE_STATEFUL:
+    if kind in (
+        _OPERATION_AUTHENTICATE_STATEFUL,
+        _OPERATION_AUTHENTICATE_SESSION,
+    ):
         _validate_now_range(index, now)
-    return kind, user_id, password, salt_bytes, now
+    if kind == _OPERATION_AUTHENTICATE_SESSION:
+        if not (LIFETIME_MIN <= lifetime <= LIFETIME_MAX):
+            raise BatchError(
+                "value_error",
+                index,
+                "lifetime must be in %d..%d, got %d"
+                % (LIFETIME_MIN, LIFETIME_MAX, lifetime),
+                EXIT_VALUE_ERROR,
+            )
+        if now + lifetime > MAX_NOW:
+            raise BatchError(
+                "value_error",
+                index,
+                "now + lifetime must not exceed %d, got %d + %d"
+                % (MAX_NOW, now, lifetime),
+                EXIT_VALUE_ERROR,
+            )
+    if kind == _OPERATION_VALIDATE_SESSION and not (0 <= now <= MAX_NOW):
+        raise BatchError(
+            "value_error",
+            index,
+            "now must be in 0..%d, got %d" % (MAX_NOW, now),
+            EXIT_VALUE_ERROR,
+        )
+    return kind, user_id, password, salt_bytes, now, session_id, lifetime
 
 
 def run_batch(registry, operations):
@@ -317,7 +450,15 @@ def run_batch(registry, operations):
     ]
     working = registry.copy()
     results = []
-    for index, (kind, user_id, password, salt, now) in enumerate(validated):
+    for index, (
+        kind,
+        user_id,
+        password,
+        salt,
+        now,
+        session_id,
+        lifetime,
+    ) in enumerate(validated):
         if kind == _OPERATION_REGISTER:
             try:
                 working.register(user_id, password, salt)
@@ -353,7 +494,7 @@ def run_batch(registry, operations):
             if not accepted:
                 result["reason"] = "invalid_password"
             results.append(result)
-        else:
+        elif kind == _OPERATION_AUTHENTICATE_STATEFUL:
             try:
                 status, reason, failed_attempts, locked_until = (
                     working.authenticate_stateful(user_id, password, now)
@@ -383,8 +524,76 @@ def run_batch(registry, operations):
                     "locked_until": locked_until,
                 }
             )
+        elif kind == _OPERATION_AUTHENTICATE_SESSION:
+            try:
+                status, reason, expires_at = working.authenticate_session(
+                    user_id, password, session_id, now, lifetime
+                )
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            except StateRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for user: %s"
+                    % (exc.now, exc.last_now, exc.user_id),
+                    EXIT_STATE_ERROR,
+                )
+            except DuplicateSessionError:
+                raise BatchError(
+                    "duplicate_session",
+                    index,
+                    "session already exists: %s" % session_id,
+                    EXIT_DUPLICATE_SESSION,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_AUTHENTICATE_SESSION,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "status": status,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                }
+            )
+        else:
+            try:
+                status, reason, owner_id, expires_at = working.validate_session(
+                    session_id, now
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except SessionRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed check now %d "
+                    "for session: %s" % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_VALIDATE_SESSION,
+                    "session_id": session_id,
+                    "user_id": owner_id,
+                    "status": status,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                }
+            )
     registry._credentials = working._credentials
     registry._states = working._states
+    registry._sessions = working._sessions
     return results
 
 
@@ -461,7 +670,8 @@ def _build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
-            "register / authenticate / authenticate_stateful 操作，\n"
+            "register / authenticate / authenticate_stateful /\n"
+            "authenticate_session / validate_session 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -473,8 +683,12 @@ def _build_parser():
             "  user_id: 字符串，1..64 个 Unicode 码点，不含控制字符 (Cc)。\n"
             "  password: 字符串，UTF-8 编码长度 8..128 字节。\n"
             "  salt (仅 register): 恰好 32 个十六进制字符，表示 16 字节。\n"
-            "  now (仅 authenticate_stateful): 0..9007199254740991 的 JSON 整数，\n"
-            "  表示调用方注入的秒数；功能不读取系统时间。\n"
+            "  session_id (会话操作): 字符串，1..64 个 Unicode 码点，\n"
+            "  不含控制字符 (Cc)。\n"
+            "  now (authenticate_stateful/authenticate_session/validate_session):\n"
+            "  0..9007199254740991 的 JSON 整数，调用方注入的秒数，不读系统时间。\n"
+            "  lifetime (仅 authenticate_session): 1..86400 的 JSON 整数，\n"
+            "  且 now+lifetime 不得超过 9007199254740991。\n"
             "  字符串按原值处理：不去空白、不改大小写、不做 Unicode 归一化。\n"
             "  操作对象只允许上述字段；凭据编码为\n"
             "  pbkdf2_sha256$200000$盐十六进制$摘要十六进制，输出不含明文口令。\n"
@@ -484,13 +698,27 @@ def _build_parser():
             "  denied/account_locked 且不计数；now 到达截止值后先解锁再校验。\n"
             "  口令正确返回 accepted 并清零计数与截止值。同一用户的 now 不得\n"
             "  早于上次已提交时间（相等合法），否则整批 state_error。\n"
+            "authenticate_session:\n"
+            "  沿用 authenticate_stateful 的凭据校验、时间单调性、失败计数与\n"
+            "  锁定语义。拒绝（invalid_password/account_locked）时不创建会话，\n"
+            "  返回 session_id 与 expires_at:null；成功时创建内存会话，\n"
+            "  expires_at 为 now+lifetime。session_id 重复报 duplicate_session。\n"
+            "validate_session:\n"
+            "  会话保存最近已提交的检查时间；now 早于该值报 state_error（状态\n"
+            "  不变），相等允许重复检查。now 小于 expires_at 返回 accepted，\n"
+            "  达到或超过返回 denied/session_expired，过期为终态。检查不刷新\n"
+            "  过期时刻，也不改变用户认证状态。未知 session_id 报\n"
+            "  unknown_session。会话仅驻留当前进程。\n"
             "退出码:\n"
-            "  0  成功（含口令校验被拒绝 denied/invalid_password、account_locked）\n"
+            "  0  成功（含 denied/invalid_password、account_locked、\n"
+            "     denied/session_expired 等普通拒绝结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
-            "  3  value_error：长度、salt 编码、now 范围或批量上限错误\n"
+            "  3  value_error：长度、salt 编码、now/lifetime 范围或批量上限错误\n"
             "  4  duplicate_user：重复登记（不覆盖原凭据）\n"
             "  5  unknown_user：操作引用了未登记的用户\n"
-            "  6  state_error：now 早于该用户上次已提交时间"
+            "  6  state_error：now 早于该用户/会话上次已提交时间\n"
+            "  7  duplicate_session：session_id 已存在\n"
+            "  8  unknown_session：validate_session 引用了不存在的会话"
         ),
     )
     return parser
