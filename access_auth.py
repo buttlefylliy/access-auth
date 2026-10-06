@@ -3,8 +3,8 @@
 
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
-authenticate_stateful / authenticate_session / validate_session 操作，
-并向标准输出写入紧凑 JSON 结果。
+authenticate_stateful / authenticate_session / validate_session /
+terminate_session 操作，并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
 
@@ -52,6 +52,7 @@ _OPERATION_AUTHENTICATE = "authenticate"
 _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
 _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
+_OPERATION_TERMINATE_SESSION = "terminate_session"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -70,6 +71,11 @@ _REQUIRED_KEYS = {
         "lifetime",
     ),
     _OPERATION_VALIDATE_SESSION: (
+        "operation",
+        "session_id",
+        "now",
+    ),
+    _OPERATION_TERMINATE_SESSION: (
         "operation",
         "session_id",
         "now",
@@ -113,11 +119,11 @@ class DuplicateSessionError(Exception):
 
 
 class UnknownSessionError(Exception):
-    """validate_session 引用了不存在的会话。"""
+    """validate_session / terminate_session 引用了不存在的会话。"""
 
 
 class SessionTimeRegressionError(Exception):
-    """validate_session 的 now 早于该会话上次已提交的检查时间。"""
+    """会话操作的 now 早于该会话上次已提交的时间。"""
 
     def __init__(self, session_id, now, last_now):
         super().__init__(session_id)
@@ -141,10 +147,13 @@ class UserRegistry:
     (last_now, failed_attempts, locked_until)，值为不可变元组，
     不保留认证历史。
 
-    会话仅驻留内存：session_id -> (user_id, expires_at, last_check)，
-    其中 last_check 为最近已提交的检查时间（创建时为 None）。
+    会话仅驻留内存：session_id -> (user_id, expires_at, last_check,
+    terminated_at)，其中 last_check 为最近已提交的检查/终止时间（创建时为
+    None），terminated_at 为首次终止时间（未终止为 None）。
     会话过期是终态：过期记录保留在表中直至进程结束，重复创建同 id
-    仍判为重复，重复校验仍返回 session_expired。
+    仍判为重复，重复校验仍返回 session_expired。会话终止同为终态：
+    重复终止幂等返回首次 terminated_at，此后校验一律返回
+    session_terminated。
     """
 
     def __init__(self):
@@ -237,28 +246,64 @@ class UserRegistry:
         if session_id in self._sessions:
             raise DuplicateSessionError(session_id)
         expires_at = now + lifetime
-        self._sessions[session_id] = (user_id, expires_at, None)
+        self._sessions[session_id] = (user_id, expires_at, None, None)
         return ("accepted", None, expires_at)
 
     def validate_session(self, session_id, now):
-        """按注入时间校验会话是否仍未过期。
+        """按注入时间校验会话是否仍未过期且未被终止。
 
         返回 (status, reason, user_id, expires_at) 并提交本次检查时间：
-        now 早于该会话最近已提交的检查时间时抛出 SessionTimeRegressionError，
-        状态不变（相等时间允许重复检查）；now < expires_at 返回 accepted；
+        now 早于该会话最近已提交的时间时抛出 SessionTimeRegressionError，
+        状态不变（相等时间允许重复检查）；已终止的会话一律返回
+        denied/session_terminated；未终止时 now < expires_at 返回 accepted；
         now >= expires_at 返回 denied/session_expired，过期为终态，过期时刻
         不被刷新，用户认证状态不被触碰。未知会话抛出 UnknownSessionError。
         """
         record = self._sessions.get(session_id)
         if record is None:
             raise UnknownSessionError(session_id)
-        user_id, expires_at, last_check = record
+        user_id, expires_at, last_check, terminated_at = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
-        self._sessions[session_id] = (user_id, expires_at, now)
+        self._sessions[session_id] = (user_id, expires_at, now, terminated_at)
+        if terminated_at is not None:
+            return ("denied", "session_terminated", user_id, expires_at)
         if now < expires_at:
             return ("accepted", None, user_id, expires_at)
         return ("denied", "session_expired", user_id, expires_at)
+
+    def terminate_session(self, session_id, now):
+        """按注入时间主动终止一个有效会话。
+
+        返回 (status, reason, user_id, terminated_at, expires_at) 并提交本次
+        时间：now 早于该会话最近已提交的时间时抛出
+        SessionTimeRegressionError，状态不变（相等时间允许重复调用）。
+        未终止且 now < expires_at：写入终止标记，返回 terminated 与首次
+        终止时间 now；已终止：幂等返回首次 terminated_at，不改写终止时间；
+        未终止但 now >= expires_at：会话保持过期终态，返回
+        denied/session_expired 且 terminated_at 为 None。
+        终止不改变用户失败计数、锁定状态或其他会话。
+        未知会话抛出 UnknownSessionError。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        user_id, expires_at, last_check, terminated_at = record
+        if last_check is not None and now < last_check:
+            raise SessionTimeRegressionError(session_id, now, last_check)
+        if terminated_at is not None:
+            self._sessions[session_id] = (
+                user_id,
+                expires_at,
+                now,
+                terminated_at,
+            )
+            return ("terminated", None, user_id, terminated_at, expires_at)
+        if now >= expires_at:
+            self._sessions[session_id] = (user_id, expires_at, now, None)
+            return ("denied", "session_expired", user_id, None, expires_at)
+        self._sessions[session_id] = (user_id, expires_at, now, now)
+        return ("terminated", None, user_id, now, expires_at)
 
 
 def _is_control_free(value):
@@ -329,8 +374,8 @@ def _validate_operation(index, operation):
             "parameter_error",
             index,
             "field 'operation' must be 'register', 'authenticate', "
-            "'authenticate_stateful', 'authenticate_session' or "
-            "'validate_session'",
+            "'authenticate_stateful', 'authenticate_session', "
+            "'validate_session' or 'terminate_session'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -409,6 +454,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
+        _OPERATION_TERMINATE_SESSION,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
@@ -420,6 +466,7 @@ def _validate_operation(index, operation):
     if kind in (
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
+        _OPERATION_TERMINATE_SESSION,
     ):
         session_id = _validate_string_field(operation, "session_id", index)
         if not (
@@ -588,7 +635,7 @@ def run_batch(registry, operations):
                     "expires_at": expires_at,
                 }
             )
-        else:
+        elif kind == _OPERATION_VALIDATE_SESSION:
             session_id = op["session_id"]
             try:
                 status, reason, session_user_id, expires_at = (
@@ -616,6 +663,38 @@ def run_batch(registry, operations):
                     "user_id": session_user_id,
                     "status": status,
                     "reason": reason,
+                    "expires_at": expires_at,
+                }
+            )
+        else:
+            session_id = op["session_id"]
+            try:
+                status, reason, session_user_id, terminated_at, expires_at = (
+                    working.terminate_session(session_id, op["now"])
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except SessionTimeRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for session: %s"
+                    % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_TERMINATE_SESSION,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": status,
+                    "reason": reason,
+                    "terminated_at": terminated_at,
                     "expires_at": expires_at,
                 }
             )
@@ -699,7 +778,7 @@ def _build_parser():
         description=(
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
-            "authenticate_session / validate_session 操作，\n"
+            "authenticate_session / validate_session / terminate_session 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -732,14 +811,26 @@ def _build_parser():
             "  的终态会话）整批 duplicate_session。结果键序为 operation、\n"
             "  user_id、session_id、status、reason、expires_at。\n"
             "validate_session:\n"
-            "  now 早于该会话最近已提交的检查时间时整批 state_error（状态不变，\n"
-            "  相等时间允许重复检查）；now 小于 expires_at 返回 accepted，\n"
-            "  达到或超过返回 denied/session_expired，过期为终态，不刷新过期\n"
-            "  时刻，也不改变用户认证状态。未知 session_id 整批 unknown_session。\n"
-            "  结果键序为 operation、session_id、user_id、status、reason、\n"
-            "  expires_at。会话仅驻留当前进程。\n"
+            "  now 早于该会话最近已提交的时间时整批 state_error（状态不变，\n"
+            "  相等时间允许重复检查）；已终止的会话一律返回\n"
+            "  denied/session_terminated；未终止时 now 小于 expires_at 返回\n"
+            "  accepted，达到或超过返回 denied/session_expired，过期为终态，\n"
+            "  不刷新过期时刻，也不改变用户认证状态。未知 session_id 整批\n"
+            "  unknown_session。结果键序为 operation、session_id、user_id、\n"
+            "  status、reason、expires_at。会话仅驻留当前进程。\n"
+            "terminate_session:\n"
+            "  按注入时间主动终止有效会话，字段与校验同 validate_session。\n"
+            "  now 早于该会话最近已提交的时间时整批 state_error（状态不变，\n"
+            "  相等时间允许重复调用）。未终止且 now 小于 expires_at：返回\n"
+            "  terminated，terminated_at 为首次终止时间 now；再次终止幂等返回\n"
+            "  首次 terminated_at，不改写终止时间；now 达到或超过 expires_at：\n"
+            "  会话保持过期终态，返回 denied/session_expired 且 terminated_at\n"
+            "  为 null。终止不改变用户失败计数、锁定状态或其他会话。\n"
+            "  未知 session_id 整批 unknown_session。结果键序为 operation、\n"
+            "  session_id、user_id、status、reason、terminated_at、expires_at。\n"
             "退出码:\n"
-            "  0  成功（含 denied/invalid_password、account_locked、session_expired）\n"
+            "  0  成功（含 denied/invalid_password、account_locked、\n"
+            "      session_expired、session_terminated 与 terminated）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
             "  3  value_error：长度、salt 编码、now/lifetime 范围或批量上限错误\n"
             "  4  duplicate_user：重复登记（不覆盖原凭据）\n"
