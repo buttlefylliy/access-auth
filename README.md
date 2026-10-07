@@ -276,6 +276,35 @@
   * 结果固定键序为 operation、session_id、user_id、status、event_count、
     events，status 为 reported；事件固定键序为 sequence、now、port_id、
     vlan_id、status、reason。
+* `list_session_trace`：为指定 session_id 返回该会话已提交的统一有序、可
+  重放的生命周期轨迹，仅接收 operation 和 session_id。
+  * `authenticate_session` 成功创建会话时写入第一条事件；随后
+    `validate_session`、`check_admission`、`record_accounting_interim`、
+    `terminate_session` 与 `report_session_disconnect` 每提交一次业务结果
+    就追加一条，相同 `now` 的重复调用也分别记录。准入事件携带 `port_id`
+    与 `vlan_id`，成功的中间计费事件携带其计费 `sequence`。
+  * `reauthenticate_session` 进入终态源的认证判定后，在源轨迹记录结果并
+    以 `related_session_id` 指向请求中的新 session_id；成功创建替代会话
+    时，新会话也写入首条事件并指回源会话。`session_active` 只记入源轨迹；
+    未知会话、时间回退、重复 session_id 等整批异常不留记录。
+  * 事件按该会话提交顺序从 1 连续编号，固定键序为 sequence、operation、
+    now、status、reason、port_id、vlan_id、related_session_id、
+    expires_at、terminated_at、disconnected_at、accounting_sequence；
+    不适用字段为 null，事件不含口令、盐、编码凭据或摘要。成功创建会话的
+    事件携带其 expires_at；主动终止事件携带首次 terminated_at，异常断线
+    事件携带首次 disconnected_at。
+  * 查询只读：events 按 sequence 升序返回已提交事件，没有事件时返回空
+    数组和 event_count 0，重复查询逐字节一致；查询不推进时间、不刷新
+    活动，也不生成其他事件。
+  * 轨迹参加现有原子提交与回滚：同批后续操作失败时新增记录随其他状态一
+    并撤销。受每批最多 1000 个操作限制，单次操作至多向源会话和替代会话
+    各追加一条固定大小记录，每个会话最多返回 1000 条；查询时间与返回
+    内存随事件数线性增长。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；字段缺失、多余
+    或类型错误为 `parameter_error`（退出码 2），session_id 取值不合法为
+    `value_error`（退出码 3）。
+  * 结果固定键序为 operation、session_id、user_id、status、event_count、
+    events，status 为 reported。
 * `record_accounting_interim`：为有效会话写入一条中间计费点，仅接收
   operation、session_id、`now`，字段约束沿用现有会话入口，时间只取显式输入。
   * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该会话
@@ -395,8 +424,9 @@
 会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、按用户
 锁定策略、认证事件
 轨迹、计费事件
-轨迹与准入判定事件
-轨迹恢复到批次
+轨迹、准入判定事件
+轨迹与会话生命周期轨迹
+恢复到批次
 开始前，普通
 拒绝、会话过期、
 空闲过期与会话终止作为成功结果提交。未知用户报
