@@ -235,6 +235,23 @@
   * 结果固定键序为 operation、source_session_id、session_id、user_id、
     status、reason、expires_at；成功时 status 为 accepted、reason 为
     null、expires_at 为新过期时刻，拒绝时 expires_at 为 null。
+* `unlock_account`：对已登记用户执行确定性的人工解锁，仅接收 operation、
+  user_id 与 `now`；字段约束同 `authenticate_stateful`，`now` 须显式注入，
+  不读取系统时间。
+  * 成功后将该用户的失败计数归零、锁定截止值置为 null，并把 `now` 记为
+    最近已提交的认证状态时间；无论调用前处于锁定、只有累计失败、锁定已
+    自然到期还是干净状态，都返回同一个幂等结果，以相同 `now` 重复提交时
+    输出逐字节一致。
+  * 遵循该用户现有的时间单调规则：`now` 早于最近已提交认证状态时间整批
+    `state_error`（退出码 6），相等时间允许执行；未知 user_id 整批
+    `unknown_user`（退出码 5）。
+  * 本操作不校验口令，不产生认证或计费事件，也不修改编码凭据、无状态
+    `authenticate` 的结果、既有会话及其超时、并发限额或准入策略；原有
+    自动到期解锁、锁定期间拒绝及成功认证清零的语义不变，解锁后的新失败
+    从一次重新累计。
+  * 结果固定键序为 operation、user_id、status、reason、failed_attempts、
+    locked_until，status 为 unlocked，reason 与 locked_until 为 null，
+    failed_attempts 为 0。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
