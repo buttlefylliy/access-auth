@@ -21,6 +21,23 @@
 ## 操作
 
 * `register`：登记用户（user_id、password、salt），重复登记报 `duplicate_user`（退出码 4）。
+* `replace_credential`：确定性替换一个已登记用户的口令和盐，接收 operation、
+  user_id、password、salt；各字段沿用 `register` 的公开约束（口令按 UTF-8 计为
+  8..128 字节，盐为表示 16 字节的 32 个十六进制字符）。不重新登记用户，也不重建
+  其他状态。
+  * 成功时完整替换该用户的编码凭据（沿用现有编码格式），后续所有认证入口只接受
+    新口令，并继续以常数时间比较摘要；相同 user_id、password、salt 的重复提交
+    返回逐字节相同结果且不产生额外状态变化。
+  * 凭据替换不视为认证，也不等同于人工解锁：不改变失败次数、locked_until、
+    最近认证时间、现有会话及其超时、并发上限、准入策略、默认动作和覆盖规则，
+    也不新增认证、准入或计费事件；已锁定账户更新后仍保持原锁定状态，已有活动
+    会话继续按原生命周期工作，只有此后的口令校验读取新凭据。
+  * 未知 user_id 整批 `unknown_user`（退出码 5）；字段缺失、额外字段或 JSON
+    类型错误沿用 `parameter_error`（退出码 2），标识、口令或盐的长度、控制
+    字符及编码取值不合法沿用 `value_error`（退出码 3）。整批全部操作完成静态
+    校验后才能执行，批内任一后续操作失败时本次替换随整批回滚，旧口令仍有效。
+  * 结果与错误不回显明文口令、盐、编码凭据或摘要；结果固定键序为 operation、
+    user_id、status，status 为 updated。
 * `authenticate`：无状态口令校验，返回 accepted 或 denied/invalid_password。
 * `authenticate_stateful`：带失败计数与临时锁定的口令校验。额外接收 `now`
   （0..9007199254740991 的 JSON 整数，调用方注入的秒数；不读取系统时间）。
