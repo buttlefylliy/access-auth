@@ -3,7 +3,8 @@
 
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
-authenticate_stateful / unlock_account / authenticate_session /
+authenticate_stateful / unlock_account / replace_credential /
+authenticate_session /
 validate_session / terminate_session / set_session_limit /
 set_admission_policy / set_admission_default /
 set_admission_overrides / check_admission /
@@ -69,6 +70,7 @@ _OPERATION_REGISTER = "register"
 _OPERATION_AUTHENTICATE = "authenticate"
 _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
 _OPERATION_UNLOCK_ACCOUNT = "unlock_account"
+_OPERATION_REPLACE_CREDENTIAL = "replace_credential"
 _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
 _OPERATION_TERMINATE_SESSION = "terminate_session"
@@ -98,6 +100,12 @@ _REQUIRED_KEYS = {
         "operation",
         "user_id",
         "now",
+    ),
+    _OPERATION_REPLACE_CREDENTIAL: (
+        "operation",
+        "user_id",
+        "password",
+        "salt",
     ),
     _OPERATION_AUTHENTICATE_SESSION: (
         "operation",
@@ -259,6 +267,14 @@ class UserRegistry:
     状态，都提交同一个幂等状态 (now, 0, None)。人工解锁不校验口令、
     不修改编码凭据，也不产生认证或计费事件；解锁后的新失败从一次
     重新累计。未知用户抛出 UnknownUserError。
+
+    replace_credential 对已登记用户执行确定性的凭据替换：完整替换该
+    用户的编码凭据，不重新登记用户，也不重建其他状态。它不视为认证，
+    也不等同于人工解锁：不改变失败次数、locked_until、最近认证时间、
+    现有会话及其超时、并发上限、准入策略、默认动作和覆盖规则，也不
+    新增认证、准入或计费事件；已锁定账户更新后仍保持原锁定状态，已有
+    活动会话继续按原生命周期工作，只有此后的口令校验读取新凭据。
+    未知用户抛出 UnknownUserError。
 
     会话仅驻留内存：session_id -> (user_id, expires_at, last_check,
     terminated_at, idle_timeout, last_activity, idle_expired)，其中
@@ -477,6 +493,19 @@ class UserRegistry:
         """登记用户；salt 为 16 字节。重复登记抛出 DuplicateUserError。"""
         if user_id in self._credentials:
             raise DuplicateUserError(user_id)
+        self._credentials[user_id] = encode_credential(password, salt)
+
+    def replace_credential(self, user_id, password, salt):
+        """确定性替换已登记用户的编码凭据；salt 为 16 字节。
+
+        完整替换该用户的编码凭据，不重新登记用户：不改变失败计数、
+        locked_until、最近已提交认证状态时间、既有会话及其超时、并发上限、
+        准入策略、默认动作、覆盖规则、空闲超时配置，也不追加认证、准入或
+        计费事件。以相同 user_id、password、salt 重复提交时结果逐字节一致
+        且不产生额外状态变化。未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
         self._credentials[user_id] = encode_credential(password, salt)
 
     @staticmethod
@@ -1302,6 +1331,7 @@ def _validate_operation(index, operation):
             index,
             "field 'operation' must be 'register', 'authenticate', "
             "'authenticate_stateful', 'unlock_account', "
+            "'replace_credential', "
             "'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
@@ -1333,6 +1363,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE,
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_UNLOCK_ACCOUNT,
+        _OPERATION_REPLACE_CREDENTIAL,
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_SET_SESSION_LIMIT,
         _OPERATION_SET_ADMISSION_POLICY,
@@ -1363,6 +1394,7 @@ def _validate_operation(index, operation):
 
     if kind in (
         _OPERATION_REGISTER,
+        _OPERATION_REPLACE_CREDENTIAL,
         _OPERATION_AUTHENTICATE,
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_AUTHENTICATE_SESSION,
@@ -1380,7 +1412,7 @@ def _validate_operation(index, operation):
             )
         validated["password"] = password
 
-    if kind == _OPERATION_REGISTER:
+    if kind in (_OPERATION_REGISTER, _OPERATION_REPLACE_CREDENTIAL):
         salt = _validate_string_field(operation, "salt", index)
         if len(salt) != SALT_HEX_LENGTH or any(
             ch not in _HEX_DIGITS for ch in salt
@@ -1810,6 +1842,28 @@ def run_batch(registry, operations):
                     "reason": None,
                     "failed_attempts": 0,
                     "locked_until": None,
+                }
+            )
+        elif kind == _OPERATION_REPLACE_CREDENTIAL:
+            user_id = op["user_id"]
+            try:
+                working.replace_credential(
+                    user_id, op["password"], op["salt"]
+                )
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            # 凭据替换不视为认证：不改变认证状态、会话、策略与各类轨迹，
+            # 也不追加认证、准入或计费事件；相同输入重复提交结果逐字节一致。
+            results.append(
+                {
+                    "operation": _OPERATION_REPLACE_CREDENTIAL,
+                    "user_id": user_id,
+                    "status": "updated",
                 }
             )
         elif kind == _OPERATION_GET_ACCOUNT_STATUS:
@@ -2442,7 +2496,8 @@ def _build_parser():
         description=(
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
-            "unlock_account / authenticate_session / validate_session /\n"
+            "unlock_account / replace_credential /\n"
+            "authenticate_session / validate_session /\n"
             "terminate_session / set_session_limit / set_admission_policy /\n"
             "set_admission_default / set_admission_overrides /\n"
             "check_admission / set_session_idle_timeout /\n"
@@ -2460,7 +2515,8 @@ def _build_parser():
             "字段限制:\n"
             "  user_id: 字符串，1..64 个 Unicode 码点，不含控制字符 (Cc)。\n"
             "  password: 字符串，UTF-8 编码长度 8..128 字节。\n"
-            "  salt (仅 register): 恰好 32 个十六进制字符，表示 16 字节。\n"
+            "  salt (仅 register 与 replace_credential): 恰好 32 个十六进制字符，\n"
+            "  表示 16 字节。\n"
             "  now (有状态操作): 0..9007199254740991 的 JSON 整数，\n"
             "  表示调用方注入的秒数；功能不读取系统时间。\n"
             "  session_id (会话操作): 字符串，1..64 个 Unicode 码点，不含控制字符。\n"
@@ -2503,6 +2559,23 @@ def _build_parser():
             "  operation、user_id、status、reason、failed_attempts、\n"
             "  locked_until；status 为 unlocked，reason 与 locked_until 为 null，\n"
             "  failed_attempts 为 0。\n"
+            "replace_credential:\n"
+            "  对已登记用户确定性替换编码凭据，接收 user_id、password 与 salt，\n"
+            "  字段约束同 register（password 为 UTF-8 8..128 字节，salt 为恰好\n"
+            "  32 个十六进制字符表示 16 字节）。成功后完整替换该用户的编码凭据，\n"
+            "  不重新登记用户；此后所有认证入口只接受新口令，并继续以常数时间\n"
+            "  比较摘要。相同 user_id、password、salt 重复提交返回逐字节相同\n"
+            "  结果且不产生额外状态变化。未知 user_id 整批 unknown_user\n"
+            "  （退出码 5）；字段缺失、额外字段或类型错误为 parameter_error\n"
+            "  （退出码 2），长度、控制字符或编码取值不合法为 value_error\n"
+            "  （退出码 3）。凭据替换不视为认证，也不等同于人工解锁：不改变\n"
+            "  失败次数、locked_until、最近认证时间、现有会话及其超时、并发\n"
+            "  上限、准入策略、默认动作和覆盖规则，也不新增认证、准入或计费\n"
+            "  事件；已锁定账户更新后仍保持原锁定状态，已有活动会话继续按原\n"
+            "  生命周期工作。整批静态校验完成后才执行，批内任一后续操作失败时\n"
+            "  本次替换随整批回滚，旧口令仍有效。结果固定键序为 operation、\n"
+            "  user_id、status，status 为 updated；结果与错误不回显明文口令、\n"
+            "  盐、编码凭据或摘要。\n"
             "authenticate_session:\n"
             "  沿用 authenticate_stateful 的凭据校验、时间单调性、失败计数与\n"
             "  锁定语义；accepted 时创建内存会话，expires_at=now+lifetime，\n"

@@ -53,6 +53,23 @@
   * 结果固定键序为 operation、user_id、status、reason、failed_attempts、
     locked_until；status 为 unlocked，reason 与 locked_until 为 null，
     failed_attempts 为 0。
+* `replace_credential`：对已登记用户确定性替换编码凭据，接收 user_id、
+  password、salt，各字段沿用 `register` 的公开约束（password 按 UTF-8 计为
+  8..128 字节，salt 为表示 16 字节的 32 个十六进制字符）。
+  * 成功后完整替换该用户的编码凭据，不重新登记用户，也不重建其他状态；
+    更新后的凭据继续使用现有编码格式，后续所有认证入口只接受新口令，并继续
+    以常数时间比较摘要。结果与错误不回显明文口令、盐、编码凭据或摘要。
+  * 相同 user_id、password、salt 的重复提交返回逐字节相同结果且不产生额外
+    状态变化；未知 user_id 整批 `unknown_user`（退出码 5）；字段缺失、额外
+    字段或 JSON 类型错误沿用 `parameter_error`（退出码 2），标识、口令或盐
+    的长度、控制字符及编码取值不合法沿用 `value_error`（退出码 3）。
+  * 凭据替换不视为认证，也不等同于人工解锁：不改变失败次数、locked_until、
+    最近认证时间、现有会话及其超时、并发上限、准入策略、默认动作和覆盖规则，
+    也不新增认证、准入或计费事件；已锁定账户更新后仍保持原锁定状态，已有
+    活动会话继续按原生命周期工作，只有此后的口令校验读取新凭据。
+  * 整批全部操作完成静态校验后才能执行；批内任一后续操作失败时，本次替换
+    随整批回滚，旧口令仍有效，新口令不得部分生效。
+  * 结果固定键序为 operation、user_id、status，status 为 updated。
 * `authenticate_session`：有状态认证通过后创建确定性会话。接收 user_id、
   password、session_id、`now`、`lifetime`，沿用 `authenticate_stateful` 的
   凭据校验、用户时间单调性、失败计数与锁定语义。
