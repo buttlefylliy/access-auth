@@ -415,6 +415,23 @@
     status、reason、port_id、vlan_id、related_session_id、expires_at、
     terminated_at、disconnected_at、accounting_sequence，不适用字段为
     null。
+* `list_users`：只读查看当前批次快照中已登记的用户集合，仅接收 operation
+  字段，不接触凭据材料。
+  * 返回本批中位于它之前且已成功 `register` 的用户，按各用户首次成功登记
+    的提交先后排列；看不见位于它之后的登记。`replace_credential`、认证、
+    解锁以及各类策略配置都不改变该顺序。
+  * 初始空注册表返回 `user_count` 为 0 和空数组；合法查询不因注册表为空
+    而报错。查询不读取时钟、不推进任何用户或会话时间，不追加认证、准入、
+    计费或会话轨迹；相同状态下重复查询产生逐字节一致的 JSON。
+  * 结果不含口令、盐、编码凭据、摘要、失败次数、锁定截止值、策略内容或
+    会话标识。整批后续任一操作失败时注册表回滚到批次开始前，整批只输出
+    既有错误对象，不泄露中途查询结果。
+  * 缺少 operation、含额外字段或 operation 不是 JSON 字符串时整批
+    `parameter_error`（退出码 2）。受每批最多 1000 个操作限制，返回数组
+    至多包含 1000 个 user_id；一次查询的时间和新增内存以当前用户数 U 为
+    线性上界，不建立额外的持久索引或落盘状态。
+  * 结果固定键序为 operation、status、user_count、users，status 为
+    reported，user_count 是 users 的元素数，users 是 user_id 字符串数组。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
