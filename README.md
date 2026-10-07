@@ -388,6 +388,33 @@
     会话最近已提交时间时整批 `state_error`（退出码 6，相等时间允许）。
   * 结果固定键序为 operation、session_id、user_id、status、reason、
     disconnected_at、expires_at。
+* `list_session_trace`：为指定 session_id 返回该会话已提交的统一有序、
+  可重放生命周期轨迹，仅接收 operation 和 session_id。
+  * `authenticate_session` 成功创建会话时写入第一条事件；随后
+    `validate_session`、`check_admission`、`record_accounting_interim`、
+    `terminate_session` 和 `report_session_disconnect` 每提交一个业务结果
+    就追加一条，相同 now 的重复调用也分别记录。准入事件携带请求的
+    port_id 与 vlan_id；中间计费携带其计费 sequence，被终态或上限拒绝时
+    为 null。
+  * `reauthenticate_session` 进入终态源的认证判定后，在源会话轨迹记录
+    本次结果并以 related_session_id 指向新 session_id；session_active
+    只记入源轨迹、不指向新会话；成功创建替代会话时，新会话也写入首条
+    事件并以 related_session_id 指回源会话（携带其 expires_at）。
+  * 只有已作为普通结果提交的操作才进入轨迹：未知会话、时间回退、重复
+    session_id 等整批异常不留记录；本批后续任一操作失败时，先前新增
+    轨迹随其他状态一起回滚。事件不含口令、盐、编码凭据或摘要。
+  * 查询只读：不推进时间、不刷新活动、不生成其他事件；重复查询返回
+    逐字节相同内容。events 按 sequence 升序（每个会话从 1 连续编号），
+    无事件时返回空数组和 event_count 0；每个会话最多返回 1000 条，
+    查询时间与返回内存随事件数线性增长。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；字段缺失、
+    额外字段或类型错误为 `parameter_error`（退出码 2），session_id
+    长度或控制字符等取值不合法为 `value_error`（退出码 3）。
+  * 结果固定键序为 operation、session_id、user_id、status、event_count、
+    events，status 为 reported；事件固定键序为 sequence、operation、now、
+    status、reason、port_id、vlan_id、related_session_id、expires_at、
+    terminated_at、disconnected_at、accounting_sequence，不适用字段为
+    null。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
@@ -395,8 +422,9 @@
 会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、按用户
 锁定策略、认证事件
 轨迹、计费事件
-轨迹与准入判定事件
-轨迹恢复到批次
+轨迹、准入判定事件
+轨迹与会话生命周期轨迹
+恢复到批次
 开始前，普通
 拒绝、会话过期、
 空闲过期与会话终止作为成功结果提交。未知用户报

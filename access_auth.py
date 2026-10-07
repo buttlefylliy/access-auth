@@ -13,7 +13,7 @@ set_session_idle_timeout / list_authentication_events /
 list_accounting_events / list_admission_events /
 record_accounting_interim /
 reauthenticate_session / get_account_status / get_session_status /
-report_session_disconnect 操作，
+report_session_disconnect / list_session_trace 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -53,6 +53,7 @@ MAX_OVERRIDE_RULES = 64
 IDLE_TIMEOUT_MIN = 0
 IDLE_TIMEOUT_MAX = 86400
 MAX_ACCOUNTING_INTERIM_EVENTS = 64
+MAX_SESSION_TRACE_EVENTS = 1000
 
 # authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与默认锁定策略。
 MAX_NOW = 9007199254740991
@@ -95,6 +96,7 @@ _OPERATION_REAUTHENTICATE_SESSION = "reauthenticate_session"
 _OPERATION_GET_ACCOUNT_STATUS = "get_account_status"
 _OPERATION_GET_SESSION_STATUS = "get_session_status"
 _OPERATION_REPORT_SESSION_DISCONNECT = "report_session_disconnect"
+_OPERATION_LIST_SESSION_TRACE = "list_session_trace"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_REPLACE_CREDENTIAL: ("operation", "user_id", "password", "salt"),
@@ -205,6 +207,10 @@ _REQUIRED_KEYS = {
         "operation",
         "session_id",
         "now",
+    ),
+    _OPERATION_LIST_SESSION_TRACE: (
+        "operation",
+        "session_id",
     ),
 }
 
@@ -377,6 +383,26 @@ class UserRegistry:
     限制，每个会话每批至多产生 MAX_OPERATIONS 条事件。只读查询
     list_admission_events 不追加事件、不推进任何时间。
 
+    另维护每会话统一的生命周期轨迹 _session_traces
+    （session_id -> list[(operation, now, status, reason, port_id, vlan_id,
+    related_session_id, expires_at, terminated_at, disconnected_at,
+    accounting_sequence)]）：把该会话已提交的认证、校验、准入、中间计费、
+    终止、异常断线与再认证结果汇成按提交顺序从 1 连续编号的单一可重放
+    轨迹。authenticate_session 成功创建会话时写入首条事件；随后
+    validate_session、check_admission、record_accounting_interim、
+    terminate_session 与 report_session_disconnect 每提交一个普通业务结果
+    就为目标会话追加一条，相同 now 的重复调用也是独立事件；准入事件携带
+    请求的 port_id 与 vlan_id，中间计费携带其计费 sequence（被拒绝或达到
+    上限时为 None）。reauthenticate_session 进入终态源的认证判定后，在源
+    会话轨迹记录本次结果并以 related_session_id 指向新 session_id；
+    session_active 只记入源轨迹；成功创建替代会话时，新会话也写入首条
+    事件并以 related_session_id 指回源会话，认证失败或并发上限拒绝时新
+    会话尚未创建，不产生轨迹。整批异常（未知会话、时间回退、重复
+    session_id 等）不留记录；事件不含凭据材料。每个会话最多保存
+    MAX_SESSION_TRACE_EVENTS 条（受每批操作数上限约束）。轨迹随整批副本
+    一起提交或回滚；只读查询 list_session_trace 不追加事件、不推进时间、
+    不刷新活动。
+
     reauthenticate_session 凭终态源会话的归属与口令创建替代会话：源会话
     仍有效时返回 denied/session_active（不校验口令、不刷新活动时间、不
     修改源会话、不记事件）；源会话已终止、已硬过期、已空闲过期、已异常
@@ -420,6 +446,7 @@ class UserRegistry:
         self._auth_events = {}
         self._accounting_events = {}
         self._admission_events = {}
+        self._session_traces = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -446,6 +473,10 @@ class UserRegistry:
         clone._admission_events = {
             session_id: list(events)
             for session_id, events in self._admission_events.items()
+        }
+        clone._session_traces = {
+            session_id: list(events)
+            for session_id, events in self._session_traces.items()
         }
         return clone
 
@@ -518,6 +549,61 @@ class UserRegistry:
         if record is None:
             raise UnknownSessionError(session_id)
         return record[0], list(self._admission_events.get(session_id, ()))
+
+    def append_session_trace(
+        self,
+        session_id,
+        operation,
+        now,
+        status,
+        reason,
+        port_id=None,
+        vlan_id=None,
+        related_session_id=None,
+        expires_at=None,
+        terminated_at=None,
+        disconnected_at=None,
+        accounting_sequence=None,
+    ):
+        """为会话追加一条已提交的统一生命周期轨迹事件。
+
+        仅在各会话操作提交普通业务结果后由调用方追加；每条记录为固定大小
+        的十一元组，未适用字段为 None，不含凭据材料。每个会话的编号由
+        提交顺序（1 起始位置）派生，相同 now 的重复调用也分别记录。每个
+        会话最多保存 MAX_SESSION_TRACE_EVENTS 条。
+        """
+        events = self._session_traces.setdefault(session_id, [])
+        if len(events) >= MAX_SESSION_TRACE_EVENTS:
+            return
+        events.append(
+            (
+                operation,
+                now,
+                status,
+                reason,
+                port_id,
+                vlan_id,
+                related_session_id,
+                expires_at,
+                terminated_at,
+                disconnected_at,
+                accounting_sequence,
+            )
+        )
+
+    def list_session_trace(self, session_id):
+        """返回 (user_id, 该会话生命周期轨迹的只读副本)（按提交顺序）。
+
+        轨迹中的每条记录为
+        (operation, now, status, reason, port_id, vlan_id,
+        related_session_id, expires_at, terminated_at, disconnected_at,
+        accounting_sequence)，sequence 由调用方按 1 起始的位置派生。
+        不修改任何状态、不推进任何时间。未知会话抛出 UnknownSessionError。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        return record[0], list(self._session_traces.get(session_id, ()))
 
     def register(self, user_id, password, salt):
         """登记用户；salt 为 16 字节。重复登记抛出 DuplicateUserError。"""
@@ -1543,7 +1629,7 @@ def _validate_operation(index, operation):
             "'list_admission_events', "
             "'record_accounting_interim', 'reauthenticate_session', "
             "'get_account_status', 'get_session_status' or "
-            "'report_session_disconnect'",
+            "'report_session_disconnect', 'list_session_trace'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -1661,6 +1747,7 @@ def _validate_operation(index, operation):
         _OPERATION_REAUTHENTICATE_SESSION,
         _OPERATION_GET_SESSION_STATUS,
         _OPERATION_REPORT_SESSION_DISCONNECT,
+        _OPERATION_LIST_SESSION_TRACE,
     ):
         session_id = _validate_string_field(operation, "session_id", index)
         if not (
@@ -2218,6 +2305,17 @@ def run_batch(registry, operations):
                 reason,
                 session_id,
             )
+            # 统一生命周期轨迹：仅成功创建会话时写入首条事件；口令拒绝、
+            # 账户锁定与并发上限拒绝不创建会话，不留轨迹。
+            if status == "accepted":
+                working.append_session_trace(
+                    session_id,
+                    _OPERATION_AUTHENTICATE_SESSION,
+                    op["now"],
+                    status,
+                    reason,
+                    expires_at=expires_at,
+                )
         elif kind == _OPERATION_VALIDATE_SESSION:
             session_id = op["session_id"]
             try:
@@ -2248,6 +2346,15 @@ def run_batch(registry, operations):
                     "reason": reason,
                     "expires_at": expires_at,
                 }
+            )
+            # 每提交一个普通业务结果（含相同 now 的重复调用）就追加一条。
+            working.append_session_trace(
+                session_id,
+                _OPERATION_VALIDATE_SESSION,
+                op["now"],
+                status,
+                reason,
+                expires_at=expires_at,
             )
         elif kind == _OPERATION_SET_SESSION_LIMIT:
             user_id = op["user_id"]
@@ -2389,6 +2496,17 @@ def run_batch(registry, operations):
                 status,
                 reason,
             )
+            # 统一轨迹：准入事件携带请求的端口与 VLAN；expires_at 等非本
+            # 操作结果字段不适用，为 null。
+            working.append_session_trace(
+                session_id,
+                _OPERATION_CHECK_ADMISSION,
+                op["now"],
+                status,
+                reason,
+                port_id=op["port_id"],
+                vlan_id=op["vlan_id"],
+            )
         elif kind == _OPERATION_LIST_ADMISSION_EVENTS:
             session_id = op["session_id"]
             try:
@@ -2468,6 +2586,57 @@ def run_batch(registry, operations):
                     ],
                 }
             )
+        elif kind == _OPERATION_LIST_SESSION_TRACE:
+            session_id = op["session_id"]
+            try:
+                session_user_id, trace = working.list_session_trace(session_id)
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            # 只读：不推进时间、不刷新活动、不生成任何事件；在副本上查询
+            # 即可反映本批先前已提交的轨迹，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_LIST_SESSION_TRACE,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": "reported",
+                    "event_count": len(trace),
+                    "events": [
+                        {
+                            "sequence": sequence,
+                            "operation": trace_operation,
+                            "now": now,
+                            "status": status,
+                            "reason": reason,
+                            "port_id": port_id,
+                            "vlan_id": vlan_id,
+                            "related_session_id": related_session_id,
+                            "expires_at": expires_at,
+                            "terminated_at": terminated_at,
+                            "disconnected_at": disconnected_at,
+                            "accounting_sequence": accounting_sequence,
+                        }
+                        for sequence, (
+                            trace_operation,
+                            now,
+                            status,
+                            reason,
+                            port_id,
+                            vlan_id,
+                            related_session_id,
+                            expires_at,
+                            terminated_at,
+                            disconnected_at,
+                            accounting_sequence,
+                        ) in enumerate(trace, start=1)
+                    ],
+                }
+            )
         elif kind == _OPERATION_LIST_ACCOUNTING_EVENTS:
             session_id = op["session_id"]
             try:
@@ -2534,6 +2703,17 @@ def run_batch(registry, operations):
                     "sequence": sequence,
                 }
             )
+            # 每提交一个普通业务结果就追加一条；中间计费携带其计费
+            # sequence（被终态/上限拒绝时为 None），相同 now 的重复提交
+            # 幂等返回原编号，轨迹仍如实记录每次调用。
+            working.append_session_trace(
+                session_id,
+                _OPERATION_RECORD_ACCOUNTING_INTERIM,
+                op["now"],
+                status,
+                reason,
+                accounting_sequence=sequence,
+            )
         elif kind == _OPERATION_REAUTHENTICATE_SESSION:
             source_session_id = op["source_session_id"]
             session_id = op["session_id"]
@@ -2599,6 +2779,30 @@ def run_batch(registry, operations):
                     status,
                     reason,
                     session_id,
+                )
+            # 统一轨迹：session_active 只记入源轨迹（不指向新会话）；进入
+            # 终态源的认证判定后，源轨迹记录本次结果并以 related_session_id
+            # 指向新 session_id；成功创建替代会话时，新会话也写入首条事件
+            # 并指回源会话（携带其 expires_at）。
+            working.append_session_trace(
+                source_session_id,
+                _OPERATION_REAUTHENTICATE_SESSION,
+                op["now"],
+                status,
+                reason,
+                related_session_id=(
+                    None if reason == "session_active" else session_id
+                ),
+            )
+            if status == "accepted":
+                working.append_session_trace(
+                    session_id,
+                    _OPERATION_REAUTHENTICATE_SESSION,
+                    op["now"],
+                    status,
+                    reason,
+                    related_session_id=source_session_id,
+                    expires_at=expires_at,
                 )
         elif kind == _OPERATION_GET_SESSION_STATUS:
             session_id = op["session_id"]
@@ -2680,6 +2884,16 @@ def run_batch(registry, operations):
                     "expires_at": expires_at,
                 }
             )
+            # 每提交一个普通业务结果就追加一条（重复报告、终态拒绝也分别
+            # 记录）；disconnected_at 取该操作返回值，重复报告为首次时间。
+            working.append_session_trace(
+                session_id,
+                _OPERATION_REPORT_SESSION_DISCONNECT,
+                op["now"],
+                status,
+                reason,
+                disconnected_at=disconnected_at,
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -2712,6 +2926,16 @@ def run_batch(registry, operations):
                     "expires_at": expires_at,
                 }
             )
+            # 每提交一个普通业务结果就追加一条（重复终止、相同 now 的重复
+            # 调用也分别记录）；terminated_at 取该操作返回值。
+            working.append_session_trace(
+                session_id,
+                _OPERATION_TERMINATE_SESSION,
+                op["now"],
+                status,
+                reason,
+                terminated_at=terminated_at,
+            )
     registry._credentials = working._credentials
     registry._states = working._states
     registry._sessions = working._sessions
@@ -2724,6 +2948,7 @@ def run_batch(registry, operations):
     registry._auth_events = working._auth_events
     registry._accounting_events = working._accounting_events
     registry._admission_events = working._admission_events
+    registry._session_traces = working._session_traces
     return results
 
 
@@ -2809,7 +3034,7 @@ def _build_parser():
             "list_admission_events /\n"
             "record_accounting_interim / reauthenticate_session /\n"
             "get_account_status / get_session_status /\n"
-            "report_session_disconnect 操作，\n"
+            "report_session_disconnect / list_session_trace 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -3174,6 +3399,29 @@ def _build_parser():
             "  计数排除该会话；reauthenticate_session 可将已断线会话作为终态\n"
             "  源会话创建替代会话。结果固定键序为 operation、session_id、\n"
             "  user_id、status、reason、disconnected_at、expires_at。\n"
+            "list_session_trace:\n"
+            "  为指定 session_id 返回该会话已提交的统一有序、可重放生命\n"
+            "  周期轨迹，仅接收 operation 与 session_id。authenticate_session\n"
+            "  成功创建会话时写入第一条事件；随后 validate_session、\n"
+            "  check_admission、record_accounting_interim、terminate_session\n"
+            "  与 report_session_disconnect 每提交一个业务结果就追加一条，\n"
+            "  相同 now 的重复调用也分别记录。准入事件携带 port_id 与\n"
+            "  vlan_id，中间计费携带其 sequence（被拒绝或达到上限时为\n"
+            "  null）。reauthenticate_session 进入终态源的认证判定后，在源\n"
+            "  轨迹记录结果并以 related_session_id 指向新 session_id；\n"
+            "  session_active 只记入源轨迹且不指向新会话；成功创建替代会话\n"
+            "  时，新会话也写入首条事件并指回源会话。整批异常不留记录，\n"
+            "  事件不含凭据材料。查询只读：不推进时间、不刷新活动、不生成\n"
+            "  其他事件，重复查询逐字节一致；events 按 sequence 升序，每\n"
+            "  个会话最多返回 1000 条，每项固定键序为 sequence、operation、\n"
+            "  now、status、reason、port_id、vlan_id、related_session_id、\n"
+            "  expires_at、terminated_at、disconnected_at、\n"
+            "  accounting_sequence，不适用字段为 null。未知 session_id 整批\n"
+            "  unknown_session（退出码 8）；字段缺失、多余或类型错误为\n"
+            "  parameter_error（退出码 2），session_id 取值不合法为\n"
+            "  value_error（退出码 3）。结果固定键序为 operation、\n"
+            "  session_id、user_id、status、event_count、events，status 为\n"
+            "  reported。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
