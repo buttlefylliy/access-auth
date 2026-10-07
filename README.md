@@ -273,6 +273,28 @@
     长度、控制字符或数值越界沿用 `value_error`（退出码 3）。
   * 结果固定键序为 operation、user_id、status、failed_attempts、
     locked_until、last_authentication_at。
+* `get_session_status`：只读查询会话状态，仅接收 operation、session_id、
+  `now`；`now` 沿用现有会话入口的 JSON 整数范围（显式注入，不读取系统
+  时间）。
+  * 按现有优先级判定：主动终止标记存在时返回 terminated 和
+    session_terminated；已为空闲过期终态时返回 expired 和
+    session_idle_expired；否则 `now` 达到 expires_at 时返回 expired 和
+    session_expired；硬期限未到，但空闲超时启用且 `now` 达到
+    last_activity_at 加 idle_timeout 时返回 expired 和
+    session_idle_expired；其余返回 active，reason 为 null。
+  * 查询只读：即使 `now` 达到硬期限或空闲期限，也不写入终态、不推进
+    会话最近已提交时间、不刷新 last_activity_at，不追加认证及计费事件，
+    不影响并发计数、准入策略、凭据与账户锁定；后续校验、准入检查、终止、
+    计费中间点及再认证仍按既有语义首次提交终态，并至多生成一条 stop
+    事件。相同状态和 `now` 的重复查询生成逐字节一致的固定键序 JSON。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该
+    会话最近已提交时间时整批 `state_error`（退出码 6，相等时间允许）；
+    字段缺失、多余或类型错误报 `parameter_error`（退出码 2），长度或
+    数值越界报 `value_error`（退出码 3）。
+  * 结果固定键序为 operation、session_id、user_id、status、reason、
+    expires_at、terminated_at、idle_timeout、last_activity_at；未主动
+    终止时 terminated_at 为 null，空闲超时关闭时 idle_timeout 为 0，
+    时间值取自保存状态或确定性计算。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
