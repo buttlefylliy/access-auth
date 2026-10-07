@@ -4,9 +4,10 @@
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
 authenticate_stateful / authenticate_session / validate_session /
-terminate_session / set_session_limit / set_admission_policy /
-set_admission_default / check_admission / set_session_idle_timeout /
-list_authentication_events / list_accounting_events 操作，
+terminate_session / record_accounting_interim / set_session_limit /
+set_admission_policy / set_admission_default / check_admission /
+set_session_idle_timeout / list_authentication_events /
+list_accounting_events 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -44,6 +45,7 @@ VLAN_ID_MAX = 4094
 MAX_POLICY_RULES = 64
 IDLE_TIMEOUT_MIN = 0
 IDLE_TIMEOUT_MAX = 86400
+MAX_INTERIM_EVENTS = 64
 
 # authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与锁定时长。
 MAX_NOW = 9007199254740991
@@ -65,6 +67,7 @@ _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
 _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
 _OPERATION_TERMINATE_SESSION = "terminate_session"
+_OPERATION_RECORD_ACCOUNTING_INTERIM = "record_accounting_interim"
 _OPERATION_SET_SESSION_LIMIT = "set_session_limit"
 _OPERATION_SET_ADMISSION_POLICY = "set_admission_policy"
 _OPERATION_SET_ADMISSION_DEFAULT = "set_admission_default"
@@ -95,6 +98,11 @@ _REQUIRED_KEYS = {
         "now",
     ),
     _OPERATION_TERMINATE_SESSION: (
+        "operation",
+        "session_id",
+        "now",
+    ),
+    _OPERATION_RECORD_ACCOUNTING_INTERIM: (
         "operation",
         "session_id",
         "now",
@@ -240,16 +248,20 @@ class UserRegistry:
     整批副本一起提交或回滚；只读查询 list_authentication_events 不追加事件。
 
     另维护每会话计费轨迹 _accounting_events
-    （session_id -> list[(event_type, now, reason)]，至多两条）：
+    （session_id -> list[(event_type, now, reason)]：一条 start、至多一条
+    stop、至多 MAX_INTERIM_EVENTS 条 interim）：
     authenticate_session 成功创建会话时追加且仅追加一条 ("start", now, None)，
     时间取该请求显式传入的 now；口令拒绝、账户锁定、并发上限拒绝与整批异常
-    均不产生开始事件。validate_session、check_admission 或 terminate_session
-    首次将已有会话判为终态时追加且仅追加一条 stop 事件：主动终止取首次
-    terminated_at、reason 为 session_terminated；首次观察到硬过期取触发结果
-    的 now、reason 为 session_expired；首次观察到空闲过期取触发结果的 now、
-    reason 为 session_idle_expired。重复校验、重复终止或从另一入口再次观察
-    同一终态不改写也不追加；尚未被这些入口观察到的超时不出现在轨迹中。
-    每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条 stop。
+    均不产生开始事件。validate_session、check_admission 或
+    terminate_session 首次将已有会话判为终态时追加且仅追加一条 stop 事件：
+    主动终止取首次 terminated_at、reason 为 session_terminated；首次观察到
+    硬过期取触发结果的 now、reason 为 session_expired；首次观察到空闲过期取
+    触发结果的 now、reason 为 session_idle_expired。重复校验、重复终止或从
+    另一入口再次观察同一终态不改写也不追加；尚未被这些入口观察到的超时不出
+    现在轨迹中。record_accounting_interim 为活动会话追加
+    ("interim", now, None) 中间计费点：相同 now 幂等返回原编号，每个会话至多
+    64 条 interim，达到上限后拒绝且轨迹不变；终态会话不追加 interim。
+    每个会话的 sequence 从 1 连续递增。
     轨迹随整批副本一起提交或回滚；只读查询 list_accounting_events 不追加
     事件、不推进任何时间。
     """
@@ -309,19 +321,117 @@ class UserRegistry:
     def _record_accounting_stop(self, session_id, now, reason):
         """在会话首次被判为终态时追加 stop 计费事件。
 
-        每个会话至多一条 stop：已存在 stop 事件（轨迹已有两条）时不改写、
-        不追加，重复观察同一终态幂等。
+        每个会话至多一条 stop：轨迹中已存在 stop 事件时不改写、不追加，
+        重复观察同一终态幂等。轨迹中可能含至多 64 条 interim，因此不能以
+        事件总数判定 stop 是否存在。
         """
         events = self._accounting_events.get(session_id)
-        if events is not None and len(events) < 2:
+        if events is not None and not any(
+            event[0] == "stop" for event in events
+        ):
             events.append(("stop", now, reason))
+
+    def record_accounting_interim(self, session_id, now):
+        """为活动会话写入一条中间计费点。
+
+        返回 (status, reason, user_id, sequence) 并提交该会话本次已提交时间
+        last_check（创建后尚无已提交时间时初始化为 now）；不刷新最近活动
+        时间，不延长空闲或硬期限，也不改变认证、准入与并发上限状态。
+        now 早于该会话最近已提交时间时抛出 SessionTimeRegressionError，
+        状态与轨迹不变（相等时间允许重复提交）。
+
+        状态判定优先级与 validate_session 一致：已终止的会话一律返回
+        denied/session_terminated；已处于空闲过期终态的会话一律返回
+        denied/session_idle_expired；否则 now >= expires_at 时保持/置为硬
+        过期终态（首次观察追加一条 stop）并返回 denied/session_expired；
+        启用了空闲超时的会话 now >= last_activity + idle_timeout 时置空闲
+        过期终态（首次观察追加一条 stop）并返回 denied/session_idle_expired。
+        三种终态都不追加 interim，sequence 为 None；终态分支只提交本次检查
+        时间，不刷新最近活动时间。
+
+        活动会话按 (event_type == "interim", now) 幂等：同一会话以相同 now
+        重复提交时返回原 interim 的编号，不重复追加；每个会话至多保存 64
+        条 interim，达到上限后返回 denied/accounting_interim_limit_reached、
+        sequence 为 None，轨迹与时间状态不变。
+        未知会话抛出 UnknownSessionError。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+        ) = record
+        if last_check is not None and now < last_check:
+            raise SessionTimeRegressionError(session_id, now, last_check)
+        events = self._accounting_events.setdefault(session_id, [])
+        if terminated_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, terminated_at,
+                idle_timeout, last_activity, idle_expired,
+            )
+            return ("denied", "session_terminated", user_id, None)
+        if idle_expired:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            return ("denied", "session_idle_expired", user_id, None)
+        if now >= expires_at:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False,
+            )
+            self._record_accounting_stop(session_id, now, "session_expired")
+            return ("denied", "session_expired", user_id, None)
+        if self._idle_expired_now(idle_timeout, last_activity, now):
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True,
+            )
+            self._record_accounting_stop(
+                session_id, now, "session_idle_expired"
+            )
+            return ("denied", "session_idle_expired", user_id, None)
+        # 活动会话：先按相同 now 幂等返回原 interim 编号（不重复追加、不
+        # 改变上限计数），再在未达 64 条上限时追加新的中间计费点。
+        for sequence, (event_type, event_now, _reason) in enumerate(
+            events, start=1
+        ):
+            if event_type == "interim" and event_now == now:
+                self._sessions[session_id] = (
+                    user_id, expires_at, now, None,
+                    idle_timeout, last_activity, False,
+                )
+                return ("recorded", None, user_id, sequence)
+        interim_count = sum(
+            1 for event_type, _now, _reason in events
+            if event_type == "interim"
+        )
+        if interim_count >= MAX_INTERIM_EVENTS:
+            return (
+                "denied", "accounting_interim_limit_reached", user_id, None,
+            )
+        events.append(("interim", now, None))
+        sequence = len(events)
+        # 中间计费只推进会话最近已提交时间；最近活动时间保持不变。
+        self._sessions[session_id] = (
+            user_id, expires_at, now, None,
+            idle_timeout, last_activity, False,
+        )
+        return ("recorded", None, user_id, sequence)
 
     def list_accounting_events(self, session_id):
         """返回 (user_id, 该会话计费轨迹的只读副本)（按提交顺序）。
 
-        轨迹中的每条记录为 (event_type, now, reason)，至多一条 start 加
-        一条 stop，编号由调用方按 1 起始的位置派生。不修改任何状态。
-        未知会话抛出 UnknownSessionError。
+        轨迹中的每条记录为 (event_type, now, reason)：一条 start、至多一条
+        stop、至多 64 条 interim，编号由调用方按 1 起始的位置派生。不修改
+        任何状态。未知会话抛出 UnknownSessionError。
         """
         record = self._sessions.get(session_id)
         if record is None:
@@ -815,7 +925,8 @@ def _validate_operation(index, operation):
             index,
             "field 'operation' must be 'register', 'authenticate', "
             "'authenticate_stateful', 'authenticate_session', "
-            "'validate_session', 'terminate_session', 'set_session_limit', "
+            "'validate_session', 'terminate_session', "
+            "'record_accounting_interim', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
             "'check_admission', 'set_session_idle_timeout', "
             "'list_authentication_events' or 'list_accounting_events'",
@@ -903,12 +1014,14 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
         _OPERATION_TERMINATE_SESSION,
+        _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_CHECK_ADMISSION,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
         # authenticate_session 额外要求 now+lifetime 不越界，在 lifetime
-        # 校验后复查。
+        # 校验后复查。record_accounting_interim 不派生任何截止时刻，沿用
+        # 同一范围约束。
         _validate_now_range(index, now, LOCK_DURATION_SECONDS)
         validated["now"] = now
 
@@ -916,6 +1029,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
         _OPERATION_TERMINATE_SESSION,
+        _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_CHECK_ADMISSION,
         _OPERATION_LIST_ACCOUNTING_EVENTS,
     ):
@@ -1248,6 +1362,37 @@ def run_batch(registry, operations):
                     "expires_at": expires_at,
                 }
             )
+        elif kind == _OPERATION_RECORD_ACCOUNTING_INTERIM:
+            session_id = op["session_id"]
+            try:
+                status, reason, session_user_id, sequence = (
+                    working.record_accounting_interim(session_id, op["now"])
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except SessionTimeRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for session: %s"
+                    % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_RECORD_ACCOUNTING_INTERIM,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": status,
+                    "reason": reason,
+                    "sequence": sequence,
+                }
+            )
         elif kind == _OPERATION_SET_SESSION_LIMIT:
             user_id = op["user_id"]
             try:
@@ -1550,9 +1695,10 @@ def _build_parser():
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
             "authenticate_session / validate_session / terminate_session /\n"
-            "set_session_limit / set_admission_policy / set_admission_default /\n"
-            "check_admission / set_session_idle_timeout /\n"
-            "list_authentication_events / list_accounting_events 操作，\n"
+            "record_accounting_interim / set_session_limit /\n"
+            "set_admission_policy / set_admission_default / check_admission /\n"
+            "set_session_idle_timeout / list_authentication_events /\n"
+            "list_accounting_events 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -1630,6 +1776,22 @@ def _build_parser():
             "  终止不改变用户失败计数、锁定状态或其他会话；未知 session_id\n"
             "  整批 unknown_session。结果键序为 operation、session_id、user_id、\n"
             "  status、reason、terminated_at、expires_at。\n"
+            "record_accounting_interim:\n"
+            "  为有效会话写入中间计费点，仅接收 operation、session_id、now，\n"
+            "  字段约束同 validate_session，时间只取显式输入。未知 session_id\n"
+            "  整批 unknown_session；now 早于该会话最近已提交时间整批\n"
+            "  state_error，两种异常均不改变轨迹或时间状态。提交前按既有优先级\n"
+            "  判断终态与超时：已主动终止返回 denied/session_terminated，已空闲\n"
+            "  过期返回 denied/session_idle_expired，已硬过期返回\n"
+            "  denied/session_expired，sequence 均为 null 且不追加 interim；\n"
+            "  若本次首次观察到硬过期或空闲过期，仍只追加一条 stop，时间取本次\n"
+            "  now。活动会话提交成功时 status 为 recorded、reason 为 null、\n"
+            "  sequence 为新事件编号；相同 now 重复提交返回原 sequence，不重复\n"
+            "  追加；每个会话至多保存 64 条 interim，达到上限后按同一键序返回\n"
+            "  denied/accounting_interim_limit_reached、sequence 为 null，轨迹\n"
+            "  不变。中间计费只推进会话最近已提交时间，不刷新活动时间，不延长\n"
+            "  空闲或硬期限，也不改变认证、准入和并发上限状态。结果键序为\n"
+            "  operation、session_id、user_id、status、reason、sequence。\n"
             "set_session_limit:\n"
             "  为已登记用户设置进程内并发会话上限，接收 user_id 与 max_sessions\n"
             "  （0..64 的 JSON 整数）。未配置的用户默认不限并发；重复提交相同值\n"
@@ -1722,17 +1884,20 @@ def _build_parser():
             "  session_expired；首次观察到空闲过期取触发结果的 now、reason 为\n"
             "  session_idle_expired。重复校验、重复终止或从另一入口再次观察同一\n"
             "  终态不改写也不追加；尚未被这些入口观察到的超时不出现在轨迹中。\n"
-            "  每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条\n"
-            "  stop。查询只读：不推进用户或会话时间，也不生成事件；事件不含口令、\n"
-            "  盐或编码凭据。未知 session_id 整批 unknown_session（退出码 8）；\n"
-            "  字段缺失、多余或类型错误仍为 parameter_error。结果固定键序为\n"
-            "  operation、session_id、user_id、status、event_count、events，\n"
-            "  status 为 reported；events 按 sequence 升序，每项固定键序为\n"
-            "  sequence、event_type、now、reason。\n"
+            "  record_accounting_interim 为活动会话追加 interim 事件（now 为本次\n"
+            "  输入、reason 为 null），按提交顺序显示，每会话至多 64 条；终态\n"
+            "  拒绝与上限拒绝不追加。每个会话的 sequence 从 1 连续递增（start、\n"
+            "  interim 与可能出现的 stop 共同连续编号）。查询只读：不推进用户或\n"
+            "  会话时间，也不生成事件；事件不含口令、盐或编码凭据。未知\n"
+            "  session_id 整批 unknown_session（退出码 8）；字段缺失、多余或类型\n"
+            "  错误仍为 parameter_error。结果固定键序为 operation、session_id、\n"
+            "  user_id、status、event_count、events，status 为 reported；events\n"
+            "  按 sequence 升序，每项固定键序为 sequence、event_type、now、\n"
+            "  reason。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
-            "      session_limit_reached、\n"
+            "      session_limit_reached、accounting_interim_limit_reached、\n"
             "      policy_not_configured、policy_denied 与终止结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
             "  3  value_error：长度、salt 编码、now/lifetime 范围、规则数量、\n"
