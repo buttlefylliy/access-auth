@@ -213,6 +213,27 @@
     或类型错误仍为 `parameter_error`（退出码 2）。
   * 结果固定键序为 operation、session_id、user_id、status、event_count、
     events，status 为 reported。
+* `list_admission_events`：为指定 session_id 返回本进程当前批次内已提交的
+  准入判定轨迹，仅接收 operation 和 session_id。
+  * 每次 `check_admission` 完成普通业务判定并提交状态后，为该 session_id
+    追加一条事件，内容依次为从 1 连续递增的 sequence、请求中的 `now`、
+    `port_id`、`vlan_id`、对外返回的 status 和 reason；接受、策略拒绝、
+    默认拒绝与会话终态拒绝都如实记录。
+  * 相同 `now` 的重复请求是两次独立判定，形成两条连续事件。未知会话、
+    时间回退、字段或取值校验失败不得留下事件；同批后续操作失败时，新增
+    事件随现有状态一起回滚。
+  * 记录事件不额外改变会话时间、终态、认证状态、策略或计费轨迹，事件不
+    包含凭据材料。
+  * 查询只读：events 按 sequence 升序返回已提交事件，没有事件时返回空
+    数组和 event_count 0，重复查询逐字节一致；查询不推进时间、不刷新
+    活动，也不产生事件。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；字段缺失、多余或
+    类型错误为 `parameter_error`（退出码 2），取值错误为 `value_error`
+    （退出码 3）。受每批最多 1000 个操作限制，每个会话每批至多产生并
+    返回 1000 条事件。
+  * 结果固定键序为 operation、session_id、user_id、status、event_count、
+    events，status 为 reported；事件固定键序为 sequence、now、port_id、
+    vlan_id、status、reason。
 * `record_accounting_interim`：为有效会话写入一条中间计费点，仅接收
   operation、session_id、`now`，字段约束沿用现有会话入口，时间只取显式输入。
   * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该会话
@@ -300,7 +321,8 @@
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
 会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、认证事件
-轨迹与计费事件
+轨迹、计费事件
+轨迹与准入判定事件
 轨迹恢复到批次
 开始前，普通
 拒绝、会话过期、
