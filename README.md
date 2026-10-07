@@ -149,7 +149,8 @@
     `deny` 返回 denied/policy_denied；精确规则与默认动作均未配置返回
     denied/policy_not_configured；已配置精确规则（含空集）但未配置默认
     动作且未命中返回 denied/policy_denied。
-  * 正常判定均提交本次会话检查时间，异常则整批回滚；未知 session_id 整批
+  * 正常判定均提交本次会话检查时间，并为该会话追加一条准入判定事件
+    （见 `list_admission_events`），异常则整批回滚；未知 session_id 整批
     `unknown_session`（退出码 8），时间回退整批 `state_error`（退出码 6）。
   * 结果键序固定为 operation、session_id、user_id、port_id、vlan_id、
     status、reason。
@@ -213,6 +214,24 @@
     或类型错误仍为 `parameter_error`（退出码 2）。
   * 结果固定键序为 operation、session_id、user_id、status、event_count、
     events，status 为 reported。
+* `list_admission_events`：为指定 session_id 返回本进程当前批次内已提交的
+  准入判定轨迹，仅接收 operation 和 session_id。
+  * `check_admission` 每次完成普通业务判定并提交会话状态时为该 session_id
+    追加一条事件，内容依次为请求显式传入的 `now`、`port_id`、`vlan_id` 与
+    对外返回的 status、reason；接受、策略拒绝与会话终态拒绝均如实记录，
+    相同 `now` 的重复请求是两次独立判定，形成两条连续事件。
+  * 未知会话、时间回退、字段或取值校验失败不留下事件；本批后续任一操作
+    失败时，先前新增事件随其他状态一起回滚。记录事件不额外改变会话时间、
+    终态、认证状态、策略或计费轨迹，事件不含凭据材料。
+  * 每个会话的 sequence 从 1 连续递增，按 sequence 升序返回；受每批最多
+    1000 个操作限制，每个会话最多产生并返回 1000 条事件。
+  * 查询只读：重复查询返回逐字节相同内容，不推进会话时间、不刷新活动
+    时间，也不生成事件；无事件时返回空数组和 event_count 0。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；字段缺失、额外
+    字段或类型错误仍为 `parameter_error`（退出码 2）。
+  * 结果固定键序为 operation、session_id、user_id、status、event_count、
+    events，status 为 reported；events 每项固定键序为 sequence、now、
+    port_id、vlan_id、status、reason。
 * `record_accounting_interim`：为有效会话写入一条中间计费点，仅接收
   operation、session_id、`now`，字段约束沿用现有会话入口，时间只取显式输入。
   * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该会话
@@ -300,7 +319,8 @@
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
 会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、认证事件
-轨迹与计费事件
+轨迹、计费事件
+轨迹与准入判定事件
 轨迹恢复到批次
 开始前，普通
 拒绝、会话过期、

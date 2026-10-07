@@ -8,7 +8,8 @@ validate_session / terminate_session / set_session_limit /
 set_admission_policy / set_admission_default /
 set_admission_overrides / check_admission /
 set_session_idle_timeout / list_authentication_events /
-list_accounting_events / record_accounting_interim /
+list_accounting_events / list_admission_events /
+record_accounting_interim /
 reauthenticate_session / get_account_status / get_session_status 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
@@ -79,6 +80,7 @@ _OPERATION_CHECK_ADMISSION = "check_admission"
 _OPERATION_SET_SESSION_IDLE_TIMEOUT = "set_session_idle_timeout"
 _OPERATION_LIST_AUTHENTICATION_EVENTS = "list_authentication_events"
 _OPERATION_LIST_ACCOUNTING_EVENTS = "list_accounting_events"
+_OPERATION_LIST_ADMISSION_EVENTS = "list_admission_events"
 _OPERATION_RECORD_ACCOUNTING_INTERIM = "record_accounting_interim"
 _OPERATION_REAUTHENTICATE_SESSION = "reauthenticate_session"
 _OPERATION_GET_ACCOUNT_STATUS = "get_account_status"
@@ -152,6 +154,10 @@ _REQUIRED_KEYS = {
         "user_id",
     ),
     _OPERATION_LIST_ACCOUNTING_EVENTS: (
+        "operation",
+        "session_id",
+    ),
+    _OPERATION_LIST_ADMISSION_EVENTS: (
         "operation",
         "session_id",
     ),
@@ -318,6 +324,17 @@ class UserRegistry:
     轨迹随整批副本一起提交或回滚；只读查询 list_accounting_events 不追加
     事件、不推进任何时间。
 
+    另维护每会话准入判定轨迹 _admission_events
+    （session_id -> list[(now, port_id, vlan_id, status, reason)]）：
+    check_admission 每次完成普通业务判定并提交会话状态后为该会话追加一条
+    事件，内容依次为请求显式传入的 now、port_id、vlan_id 与对外返回的
+    status、reason；接受、策略拒绝与会话终态拒绝均如实记录，相同 now 的
+    重复请求形成两条连续事件。未知会话、时间回退与字段校验失败不留下事件。
+    每个会话的事件按提交顺序从 1 连续编号，事件不含凭据材料；记录事件不
+    额外改变会话时间、终态、认证状态、策略或计费轨迹。轨迹随整批副本一起
+    提交或回滚；只读查询 list_admission_events 不追加事件、不推进任何
+    时间。
+
     reauthenticate_session 凭终态源会话的归属与口令创建替代会话：源会话
     仍有效时返回 denied/session_active（不校验口令、不刷新活动时间、不
     修改源会话、不记事件）；源会话已终止、已硬过期、已空闲过期或本次
@@ -356,6 +373,7 @@ class UserRegistry:
         self._idle_timeouts = {}
         self._auth_events = {}
         self._accounting_events = {}
+        self._admission_events = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -377,6 +395,10 @@ class UserRegistry:
         clone._accounting_events = {
             session_id: list(events)
             for session_id, events in self._accounting_events.items()
+        }
+        clone._admission_events = {
+            session_id: list(events)
+            for session_id, events in self._admission_events.items()
         }
         return clone
 
@@ -424,6 +446,26 @@ class UserRegistry:
         if record is None:
             raise UnknownSessionError(session_id)
         return record[0], list(self._accounting_events.get(session_id, ()))
+
+    def append_admission_event(
+        self, session_id, now, port_id, vlan_id, status, reason
+    ):
+        """为会话追加一条已提交的准入判定事件（按调用顺序连续编号）。"""
+        self._admission_events.setdefault(session_id, []).append(
+            (now, port_id, vlan_id, status, reason)
+        )
+
+    def list_admission_events(self, session_id):
+        """返回 (user_id, 该会话准入判定轨迹的只读副本)（按提交顺序）。
+
+        轨迹中的每条记录为 (now, port_id, vlan_id, status, reason)，
+        编号由调用方按 1 起始的位置派生。不修改任何状态。
+        未知会话抛出 UnknownSessionError。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        return record[0], list(self._admission_events.get(session_id, ()))
 
     def register(self, user_id, password, salt):
         """登记用户；salt 为 16 字节。重复登记抛出 DuplicateUserError。"""
@@ -1257,6 +1299,7 @@ def _validate_operation(index, operation):
             "'set_admission_overrides', 'check_admission', "
             "'set_session_idle_timeout', "
             "'list_authentication_events', 'list_accounting_events', "
+            "'list_admission_events', "
             "'record_accounting_interim', 'reauthenticate_session', "
             "'get_account_status' or 'get_session_status'",
             EXIT_PARAMETER_ERROR,
@@ -1367,6 +1410,7 @@ def _validate_operation(index, operation):
         _OPERATION_TERMINATE_SESSION,
         _OPERATION_CHECK_ADMISSION,
         _OPERATION_LIST_ACCOUNTING_EVENTS,
+        _OPERATION_LIST_ADMISSION_EVENTS,
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_REAUTHENTICATE_SESSION,
         _OPERATION_GET_SESSION_STATUS,
@@ -2005,6 +2049,57 @@ def run_batch(registry, operations):
                     "reason": reason,
                 }
             )
+            # 普通业务判定（接受、策略拒绝、会话终态拒绝）均记录一条准入
+            # 事件；未知会话与时间回退在上面已整批抛出，不留下事件。
+            working.append_admission_event(
+                session_id,
+                op["now"],
+                op["port_id"],
+                op["vlan_id"],
+                status,
+                reason,
+            )
+        elif kind == _OPERATION_LIST_ADMISSION_EVENTS:
+            session_id = op["session_id"]
+            try:
+                session_user_id, events = working.list_admission_events(
+                    session_id
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            # 只读：不推进任何时间、不改变状态、不追加事件；在副本上查询
+            # 即可反映本批先前已提交的事件，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_LIST_ADMISSION_EVENTS,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": "reported",
+                    "event_count": len(events),
+                    "events": [
+                        {
+                            "sequence": sequence,
+                            "now": now,
+                            "port_id": port_id,
+                            "vlan_id": vlan_id,
+                            "status": status,
+                            "reason": reason,
+                        }
+                        for sequence, (
+                            now,
+                            port_id,
+                            vlan_id,
+                            status,
+                            reason,
+                        ) in enumerate(events, start=1)
+                    ],
+                }
+            )
         elif kind == _OPERATION_LIST_AUTHENTICATION_EVENTS:
             user_id = op["user_id"]
             try:
@@ -2341,6 +2436,7 @@ def _build_parser():
             "set_admission_default / set_admission_overrides /\n"
             "check_admission / set_session_idle_timeout /\n"
             "list_authentication_events / list_accounting_events /\n"
+            "list_admission_events /\n"
             "record_accounting_interim / reauthenticate_session /\n"
             "get_account_status / get_session_status 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
@@ -2503,7 +2599,8 @@ def _build_parser():
             "  动作且未命中返回 denied/policy_denied。对仍有效会话的判定（含策略\n"
             "  拒绝）以本次 now\n"
             "  刷新最近活动时间；异常、时间回退、硬过期与空闲过期均不刷新。\n"
-            "  正常判定均提交本次会话检查时间，异常则整批\n"
+            "  正常判定均提交本次会话检查时间，并为该会话追加一条准入判定\n"
+            "  事件（见 list_admission_events），异常则整批\n"
             "  回滚。结果键序为 operation、session_id、user_id、port_id、\n"
             "  vlan_id、status、reason。\n"
             "set_session_idle_timeout:\n"
@@ -2559,6 +2656,22 @@ def _build_parser():
             "  operation、session_id、user_id、status、event_count、events，\n"
             "  status 为 reported；events 按 sequence 升序，每项固定键序为\n"
             "  sequence、event_type、now、reason。\n"
+            "list_admission_events:\n"
+            "  为指定 session_id 返回本进程当前批次内已提交的准入判定轨迹，\n"
+            "  仅接收 operation 与 session_id。check_admission 每次完成普通业务\n"
+            "  判定并提交会话状态后为该会话追加一条事件，内容依次为请求显式传入\n"
+            "  的 now、port_id、vlan_id 与对外返回的 status、reason；接受、策略\n"
+            "  拒绝与会话终态拒绝均如实记录，相同 now 的重复请求形成两条连续\n"
+            "  事件。未知会话、时间回退与字段校验失败不留下事件；批次后续任一\n"
+            "  操作失败时，先前新增事件随其他状态一起回滚。每个会话的 sequence\n"
+            "  从 1 连续递增，每会话事件数不超过本批操作数上限。查询只读：重复\n"
+            "  查询返回逐字节相同内容，不推进会话时间、不刷新活动时间，也不生成\n"
+            "  事件；无事件时返回空数组和 0。事件不含凭据材料。未知 session_id\n"
+            "  整批 unknown_session（退出码 8）；字段缺失、多余或类型错误仍为\n"
+            "  parameter_error。结果固定键序为 operation、session_id、user_id、\n"
+            "  status、event_count、events，status 为 reported；events 按\n"
+            "  sequence 升序，每项固定键序为 sequence、now、port_id、vlan_id、\n"
+            "  status、reason。\n"
             "record_accounting_interim:\n"
             "  为有效会话写入一条中间计费点，仅接收 operation、session_id 与 now，\n"
             "  字段约束同其他会话入口，时间只取显式输入。未知 session_id 整批\n"
