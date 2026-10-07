@@ -9,7 +9,7 @@ set_admission_policy / set_admission_default /
 set_admission_overrides / check_admission /
 set_session_idle_timeout / list_authentication_events /
 list_accounting_events / record_accounting_interim /
-reauthenticate_session / get_account_status 操作，
+reauthenticate_session / get_account_status / get_session_status 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -82,6 +82,7 @@ _OPERATION_LIST_ACCOUNTING_EVENTS = "list_accounting_events"
 _OPERATION_RECORD_ACCOUNTING_INTERIM = "record_accounting_interim"
 _OPERATION_REAUTHENTICATE_SESSION = "reauthenticate_session"
 _OPERATION_GET_ACCOUNT_STATUS = "get_account_status"
+_OPERATION_GET_SESSION_STATUS = "get_session_status"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -170,6 +171,11 @@ _REQUIRED_KEYS = {
     _OPERATION_GET_ACCOUNT_STATUS: (
         "operation",
         "user_id",
+        "now",
+    ),
+    _OPERATION_GET_SESSION_STATUS: (
+        "operation",
+        "session_id",
         "now",
     ),
 }
@@ -326,6 +332,17 @@ class UserRegistry:
     状态、失败计数、锁定截止值与最近已提交认证状态时间，服从该用户既有的
     时间单调规则；不改写认证状态、不推进已提交时间、不触碰会话，也不追加
     认证或计费事件。
+
+    get_session_status 为只读查询：按注入 now 报告该会话的状态，服从该
+    会话既有的时间单调规则（now 早于最近已提交时间抛出
+    SessionTimeRegressionError，相等允许）。按既有优先级判定：主动终止
+    标记存在时返回 terminated/session_terminated；已为空闲过期终态时
+    返回 expired/session_idle_expired；否则 now 达到 expires_at 时返回
+    expired/session_expired；硬期限未到但空闲超时启用且 now 达到
+    last_activity + idle_timeout 时返回 expired/session_idle_expired；
+    其余返回 active、reason 为 None。即使 now 达到硬期限或空闲期限，也
+    不写入终态、不推进会话最近已提交时间、不刷新 last_activity，也不追加
+    认证或计费事件；不影响并发计数、准入策略、凭据与账户锁定。
     """
 
     def __init__(self):
@@ -1048,6 +1065,87 @@ class UserRegistry:
         events.append(("interim", now, None))
         return ("recorded", None, user_id, len(events))
 
+    def get_session_status(self, session_id, now):
+        """只读查询会话状态，不提交任何状态变化。
+
+        返回 (status, reason, user_id, expires_at, terminated_at,
+        idle_timeout, last_activity_at)。未知会话抛出 UnknownSessionError；
+        now 早于该会话最近已提交时间时抛出 SessionTimeRegressionError
+        （相等允许），状态不变。按既有优先级判定：主动终止标记存在时返回
+        terminated/session_terminated；已处于空闲过期终态时返回
+        expired/session_idle_expired；否则 now 达到 expires_at 时返回
+        expired/session_expired；硬期限未到但空闲超时启用且 now 达到
+        last_activity + idle_timeout 时返回 expired/session_idle_expired；
+        其余返回 active、reason 为 None。未主动终止时 terminated_at 为
+        None，空闲超时关闭时 idle_timeout 为 0，时间值取自保存状态。
+        查询不写入终态、不推进最近已提交时间、不刷新活动时间，也不追加
+        认证或计费事件；即使 now 达到硬期限或空闲期限，后续校验、终止、
+        计费中间点与再认证仍按既有语义首次提交终态。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+        ) = record
+        if last_check is not None and now < last_check:
+            raise SessionTimeRegressionError(session_id, now, last_check)
+        if terminated_at is not None:
+            return (
+                "terminated",
+                "session_terminated",
+                user_id,
+                expires_at,
+                terminated_at,
+                idle_timeout,
+                last_activity,
+            )
+        if idle_expired:
+            return (
+                "expired",
+                "session_idle_expired",
+                user_id,
+                expires_at,
+                None,
+                idle_timeout,
+                last_activity,
+            )
+        if now >= expires_at:
+            return (
+                "expired",
+                "session_expired",
+                user_id,
+                expires_at,
+                None,
+                idle_timeout,
+                last_activity,
+            )
+        if self._idle_expired_now(idle_timeout, last_activity, now):
+            return (
+                "expired",
+                "session_idle_expired",
+                user_id,
+                expires_at,
+                None,
+                idle_timeout,
+                last_activity,
+            )
+        return (
+            "active",
+            None,
+            user_id,
+            expires_at,
+            None,
+            idle_timeout,
+            last_activity,
+        )
+
 
 def _is_control_free(value):
     return all(unicodedata.category(ch) != "Cc" for ch in value)
@@ -1159,8 +1257,8 @@ def _validate_operation(index, operation):
             "'set_admission_overrides', 'check_admission', "
             "'set_session_idle_timeout', "
             "'list_authentication_events', 'list_accounting_events', "
-            "'record_accounting_interim', 'reauthenticate_session' or "
-            "'get_account_status'",
+            "'record_accounting_interim', 'reauthenticate_session', "
+            "'get_account_status' or 'get_session_status'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -1254,6 +1352,7 @@ def _validate_operation(index, operation):
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_REAUTHENTICATE_SESSION,
         _OPERATION_GET_ACCOUNT_STATUS,
+        _OPERATION_GET_SESSION_STATUS,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
@@ -1270,6 +1369,7 @@ def _validate_operation(index, operation):
         _OPERATION_LIST_ACCOUNTING_EVENTS,
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_REAUTHENTICATE_SESSION,
+        _OPERATION_GET_SESSION_STATUS,
     ):
         session_id = _validate_string_field(operation, "session_id", index)
         if not (
@@ -2075,6 +2175,48 @@ def run_batch(registry, operations):
                     reason,
                     session_id,
                 )
+        elif kind == _OPERATION_GET_SESSION_STATUS:
+            session_id = op["session_id"]
+            try:
+                (
+                    status,
+                    reason,
+                    session_user_id,
+                    expires_at,
+                    terminated_at,
+                    idle_timeout,
+                    last_activity_at,
+                ) = working.get_session_status(session_id, op["now"])
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except SessionTimeRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for session: %s"
+                    % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            # 只读：不写入终态、不推进会话时间、不刷新活动时间，也不追加
+            # 认证或计费事件；在副本上查询，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_GET_SESSION_STATUS,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": status,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                    "terminated_at": terminated_at,
+                    "idle_timeout": idle_timeout,
+                    "last_activity_at": last_activity_at,
+                }
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -2200,7 +2342,7 @@ def _build_parser():
             "check_admission / set_session_idle_timeout /\n"
             "list_authentication_events / list_accounting_events /\n"
             "record_accounting_interim / reauthenticate_session /\n"
-            "get_account_status 操作，\n"
+            "get_account_status / get_session_status 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -2474,6 +2616,23 @@ def _build_parser():
             "  user_id 整批 unknown_user（退出码 5）。结果固定键序为\n"
             "  operation、user_id、status、failed_attempts、locked_until、\n"
             "  last_authentication_at。\n"
+            "get_session_status:\n"
+            "  只读查询会话状态，仅接收 operation、session_id 与 now，字段约束\n"
+            "  同其他会话入口（now 显式注入，不读取系统时间）。按既有优先级\n"
+            "  判定：主动终止标记存在时返回 terminated/session_terminated；\n"
+            "  已处于空闲过期终态时返回 expired/session_idle_expired；否则\n"
+            "  now 达到 expires_at 时返回 expired/session_expired；硬期限未到\n"
+            "  但空闲超时启用且 now 达到 最近活动时间+idle_timeout 时返回\n"
+            "  expired/session_idle_expired；其余返回 active、reason 为 null。\n"
+            "  未主动终止时 terminated_at 为 null，空闲超时关闭时 idle_timeout\n"
+            "  为 0，时间值取自保存状态。查询不写入终态、不推进会话最近已提交\n"
+            "  时间、不刷新活动时间，也不追加认证或计费事件；即使 now 达到硬\n"
+            "  期限或空闲期限，后续校验、准入检查、终止、计费中间点与再认证仍\n"
+            "  按既有语义首次提交终态。now 早于该会话最近已提交时间时整批\n"
+            "  state_error（退出码 6，相等时间允许）；未知 session_id 整批\n"
+            "  unknown_session（退出码 8）。结果固定键序为 operation、\n"
+            "  session_id、user_id、status、reason、expires_at、terminated_at、\n"
+            "  idle_timeout、last_activity_at。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
