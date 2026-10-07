@@ -70,6 +70,25 @@
   * 结果固定键序为 operation、user_id、status、reason、failed_attempts、
     locked_until；status 为 unlocked，reason 与 locked_until 为 null，
     failed_attempts 为 0。
+* `set_lockout_policy`：为已登记用户按用户设置锁定策略，仅接收 operation、
+  user_id、`max_failed_attempts`（1..10 的 JSON 整数）和 `lock_duration`
+  （1..300 的 JSON 整数秒）；布尔值不得视为整数。
+  * 每名用户至多保存一份策略；相同配置重复提交返回逐字节一致结果，新值完整
+    替换旧值，且不改变其他状态或事件轨迹。
+  * 新策略仅作用于此后的 `authenticate_stateful`、`authenticate_session` 和
+    `reauthenticate_session`，无状态 `authenticate` 保持不变。账户未锁定时，
+    错误口令先使失败次数加一；达到或超过当时配置的 `max_failed_attempts` 时，
+    将 `locked_until` 设为 `now` 加 `lock_duration`，仍返回
+    denied/invalid_password。降低阈值不立即锁定或清零已有失败次数，下一次
+    错误口令才按新阈值判断；正确口令仍清零失败次数。
+  * 已锁定账户继续使用原 `locked_until`，配置变化不缩短或延长本次锁定，到期
+    后的下一次认证才采用新策略。未配置用户仍在第三次失败后锁定 300 秒，并
+    保留现有时间单调性、常数时间比较、事件和会话语义。
+  * 引用未知 user_id 整批 `unknown_user`（退出码 5）；字段缺失、多余或 JSON
+    类型错误返回 `parameter_error`（退出码 2）；数值越界返回 `value_error`
+    （退出码 3）。整批仍先完成静态校验，任一操作异常时配置随整批回滚。
+  * 结果固定键序为 operation、user_id、status、max_failed_attempts、
+    lock_duration，其中 status 为 configured。
 * `authenticate_session`：有状态认证通过后创建确定性会话。接收 user_id、
   password、session_id、`now`、`lifetime`，沿用 `authenticate_stateful` 的
   凭据校验、用户时间单调性、失败计数与锁定语义。
@@ -373,7 +392,8 @@
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、认证事件
+会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、按用户
+锁定策略、认证事件
 轨迹、计费事件
 轨迹与准入判定事件
 轨迹恢复到批次

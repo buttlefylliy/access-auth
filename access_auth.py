@@ -4,7 +4,8 @@
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register /
 replace_credential / authenticate /
-authenticate_stateful / unlock_account / authenticate_session /
+authenticate_stateful / unlock_account / set_lockout_policy /
+authenticate_session /
 validate_session / terminate_session / set_session_limit /
 set_admission_policy / set_admission_default /
 set_admission_overrides / check_admission /
@@ -53,10 +54,14 @@ IDLE_TIMEOUT_MIN = 0
 IDLE_TIMEOUT_MAX = 86400
 MAX_ACCOUNTING_INTERIM_EVENTS = 64
 
-# authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与锁定时长。
+# authenticate_stateful：调用方注入的秒数上限（2^53 - 1）与默认锁定策略。
 MAX_NOW = 9007199254740991
 LOCK_DURATION_SECONDS = 300
 MAX_FAILED_ATTEMPTS = 3
+LOCKOUT_MAX_FAILED_ATTEMPTS_MIN = 1
+LOCKOUT_MAX_FAILED_ATTEMPTS_MAX = 10
+LOCKOUT_DURATION_MIN = 1
+LOCKOUT_DURATION_MAX = 300
 
 EXIT_OK = 0
 EXIT_PARAMETER_ERROR = 2
@@ -72,6 +77,7 @@ _OPERATION_REPLACE_CREDENTIAL = "replace_credential"
 _OPERATION_AUTHENTICATE = "authenticate"
 _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
 _OPERATION_UNLOCK_ACCOUNT = "unlock_account"
+_OPERATION_SET_LOCKOUT_POLICY = "set_lockout_policy"
 _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
 _OPERATION_TERMINATE_SESSION = "terminate_session"
@@ -103,6 +109,12 @@ _REQUIRED_KEYS = {
         "operation",
         "user_id",
         "now",
+    ),
+    _OPERATION_SET_LOCKOUT_POLICY: (
+        "operation",
+        "user_id",
+        "max_failed_attempts",
+        "lock_duration",
     ),
     _OPERATION_AUTHENTICATE_SESSION: (
         "operation",
@@ -317,6 +329,17 @@ class UserRegistry:
     未配置或配置为 0 均表示关闭空闲超时。配置只在创建会话时快照进会话
     记录，已有会话沿用创建时的配置；lifetime 仍是不可延长的硬期限。
 
+    另维护每用户锁定策略 _lockout_policies
+    （user_id -> (max_failed_attempts, lock_duration)，每用户至多一份）；
+    未配置的用户沿用默认策略：第三次失败锁定 300 秒。策略只影响此后的
+    authenticate_stateful、authenticate_session 与 reauthenticate_session：
+    账户未锁定时错误口令先使失败次数加一，达到或超过当时配置的
+    max_failed_attempts 时把 locked_until 设为 now+lock_duration，仍返回
+    denied/invalid_password；降低阈值不立即锁定、不清零已有失败次数，下一
+    次错误口令才按新阈值判断；正确口令仍清零失败次数。已锁定账户继续使用
+    原 locked_until，配置变化不缩短或延长本次锁定，到期后的下一次认证才
+    采用新策略。无状态 authenticate 不读取该策略。
+
     另维护每用户认证事件轨迹 _auth_events
     （user_id -> list[(source, now, status, reason, session_id)]），
     仅记录已作为普通结果提交的 authenticate_stateful 与
@@ -393,6 +416,7 @@ class UserRegistry:
         self._admission_defaults = {}
         self._admission_overrides = {}
         self._idle_timeouts = {}
+        self._lockout_policies = {}
         self._auth_events = {}
         self._accounting_events = {}
         self._admission_events = {}
@@ -410,6 +434,7 @@ class UserRegistry:
         clone._admission_defaults = dict(self._admission_defaults)
         clone._admission_overrides = dict(self._admission_overrides)
         clone._idle_timeouts = dict(self._idle_timeouts)
+        clone._lockout_policies = dict(self._lockout_policies)
         clone._auth_events = {
             user_id: list(events)
             for user_id, events in self._auth_events.items()
@@ -539,6 +564,11 @@ class UserRegistry:
         新状态（含普通拒绝）。未知用户抛出 UnknownUserError；now 早于该用户
         上次已提交时间时抛出 StateRegressionError，状态不变。
         未锁定的本次请求最多执行一次 PBKDF2 校验。
+
+        锁定阈值与锁定时长取该用户当前配置（set_lockout_policy）；未配置时
+        沿用默认的第三次失败锁定 300 秒。已锁定账户继续使用原 locked_until，
+        配置变化不缩短或延长本次锁定；锁定到期清零旧计数后，下一次错误口令
+        才按当时配置的阈值判断。降低阈值不立即锁定、不清零已有失败次数。
         """
         stored = self._credentials.get(user_id)
         if stored is None:
@@ -548,20 +578,28 @@ class UserRegistry:
         )
         if last_now is not None and now < last_now:
             raise StateRegressionError(user_id, now, last_now)
+        policy = self._lockout_policies.get(user_id)
+        if policy is not None:
+            max_failed_attempts, lock_duration = policy
+        else:
+            max_failed_attempts = MAX_FAILED_ATTEMPTS
+            lock_duration = LOCK_DURATION_SECONDS
         if locked_until is not None:
             if now < locked_until:
-                # 锁定期间：不增加失败次数，仅推进已提交时间。
+                # 锁定期间：不增加失败次数，仅推进已提交时间；配置变化不
+                # 缩短或延长本次锁定。
                 self._states[user_id] = (now, failed_attempts, locked_until)
                 return ("denied", "account_locked", failed_attempts, locked_until)
-            # 到达截止值：先解锁并清零旧计数，再处理本次口令。
+            # 到达截止值：先解锁并清零旧计数，再处理本次口令；下一次错误
+            # 口令才按新阈值判断。
             failed_attempts = 0
             locked_until = None
         if self._verify_password(stored, password):
             self._states[user_id] = (now, 0, None)
             return ("accepted", None, 0, None)
         failed_attempts += 1
-        if failed_attempts >= MAX_FAILED_ATTEMPTS:
-            locked_until = now + LOCK_DURATION_SECONDS
+        if failed_attempts >= max_failed_attempts:
+            locked_until = now + lock_duration
         self._states[user_id] = (now, failed_attempts, locked_until)
         return ("denied", "invalid_password", failed_attempts, locked_until)
 
@@ -585,6 +623,21 @@ class UserRegistry:
         if last_now is not None and now < last_now:
             raise StateRegressionError(user_id, now, last_now)
         self._states[user_id] = (now, 0, None)
+
+    def set_lockout_policy(self, user_id, max_failed_attempts, lock_duration):
+        """为已登记用户设置按用户锁定策略；新值完整替换旧值。
+
+        每用户至多保存一份 (max_failed_attempts, lock_duration)；重复提交
+        相同配置幂等。策略只影响此后的 authenticate_stateful、
+        authenticate_session 与 reauthenticate_session，无状态
+        authenticate 不读取它。不改变失败次数、locked_until、最近认证时间、
+        凭据、会话、其他配置或任何事件轨迹；已锁定账户继续使用原
+        locked_until，配置变化不缩短或延长本次锁定。未知用户抛出
+        UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        self._lockout_policies[user_id] = (max_failed_attempts, lock_duration)
 
     def get_account_status(self, user_id, now):
         """只读查询已登记用户的认证状态，不提交任何状态变化。
@@ -1481,7 +1534,7 @@ def _validate_operation(index, operation):
             "field 'operation' must be 'register', 'replace_credential', "
             "'authenticate', "
             "'authenticate_stateful', 'unlock_account', "
-            "'authenticate_session', "
+            "'set_lockout_policy', 'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
             "'set_admission_overrides', 'check_admission', "
@@ -1514,6 +1567,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE,
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_UNLOCK_ACCOUNT,
+        _OPERATION_SET_LOCKOUT_POLICY,
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_SET_SESSION_LIMIT,
         _OPERATION_SET_ADMISSION_POLICY,
@@ -1704,6 +1758,40 @@ def _validate_operation(index, operation):
                 EXIT_VALUE_ERROR,
             )
         validated["idle_timeout"] = idle_timeout
+
+    if kind == _OPERATION_SET_LOCKOUT_POLICY:
+        max_failed_attempts = _validate_integer_field(
+            operation, "max_failed_attempts", index
+        )
+        if not (
+            LOCKOUT_MAX_FAILED_ATTEMPTS_MIN
+            <= max_failed_attempts
+            <= LOCKOUT_MAX_FAILED_ATTEMPTS_MAX
+        ):
+            raise BatchError(
+                "value_error",
+                index,
+                "max_failed_attempts must be %d..%d, got %d"
+                % (
+                    LOCKOUT_MAX_FAILED_ATTEMPTS_MIN,
+                    LOCKOUT_MAX_FAILED_ATTEMPTS_MAX,
+                    max_failed_attempts,
+                ),
+                EXIT_VALUE_ERROR,
+            )
+        lock_duration = _validate_integer_field(
+            operation, "lock_duration", index
+        )
+        if not (LOCKOUT_DURATION_MIN <= lock_duration <= LOCKOUT_DURATION_MAX):
+            raise BatchError(
+                "value_error",
+                index,
+                "lock_duration must be %d..%d, got %d"
+                % (LOCKOUT_DURATION_MIN, LOCKOUT_DURATION_MAX, lock_duration),
+                EXIT_VALUE_ERROR,
+            )
+        validated["max_failed_attempts"] = max_failed_attempts
+        validated["lock_duration"] = lock_duration
 
     if kind == _OPERATION_SET_ADMISSION_POLICY:
         rules = operation.get("rules")
@@ -2016,6 +2104,32 @@ def run_batch(registry, operations):
                     "reason": None,
                     "failed_attempts": 0,
                     "locked_until": None,
+                }
+            )
+        elif kind == _OPERATION_SET_LOCKOUT_POLICY:
+            user_id = op["user_id"]
+            try:
+                working.set_lockout_policy(
+                    user_id,
+                    op["max_failed_attempts"],
+                    op["lock_duration"],
+                )
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            # 只替换该用户的锁定策略：不改变失败次数、locked_until、
+            # 最近认证时间、凭据、会话与事件轨迹；相同配置重复提交幂等。
+            results.append(
+                {
+                    "operation": _OPERATION_SET_LOCKOUT_POLICY,
+                    "user_id": user_id,
+                    "status": "configured",
+                    "max_failed_attempts": op["max_failed_attempts"],
+                    "lock_duration": op["lock_duration"],
                 }
             )
         elif kind == _OPERATION_GET_ACCOUNT_STATUS:
@@ -2606,6 +2720,7 @@ def run_batch(registry, operations):
     registry._admission_defaults = working._admission_defaults
     registry._admission_overrides = working._admission_overrides
     registry._idle_timeouts = working._idle_timeouts
+    registry._lockout_policies = working._lockout_policies
     registry._auth_events = working._auth_events
     registry._accounting_events = working._accounting_events
     registry._admission_events = working._admission_events
@@ -2686,7 +2801,7 @@ def _build_parser():
         description=(
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / replace_credential / authenticate / authenticate_stateful /\n"
-            "unlock_account / authenticate_session / validate_session /\n"
+            "unlock_account / set_lockout_policy / authenticate_session / validate_session /\n"
             "terminate_session / set_session_limit / set_admission_policy /\n"
             "set_admission_default / set_admission_overrides /\n"
             "check_admission / set_session_idle_timeout /\n"
@@ -2715,6 +2830,8 @@ def _build_parser():
             "  max_sessions (仅 set_session_limit): 0..64 的 JSON 整数。\n"
             "  idle_timeout (仅 set_session_idle_timeout): 0..86400 的 JSON 整数秒，\n"
             "  0 表示关闭空闲超时。\n"
+            "  max_failed_attempts (仅 set_lockout_policy): 1..10 的 JSON 整数。\n"
+            "  lock_duration (仅 set_lockout_policy): 1..300 的 JSON 整数秒。\n"
             "  port_id (准入操作): 字符串，1..64 个 Unicode 码点，不含控制字符。\n"
             "  vlan_id (准入操作): 1..4094 的 JSON 整数。\n"
             "  rules (仅 set_admission_policy): 最多 64 项的 JSON 数组，每项为仅含\n"
@@ -2760,6 +2877,25 @@ def _build_parser():
             "  operation、user_id、status、reason、failed_attempts、\n"
             "  locked_until；status 为 unlocked，reason 与 locked_until 为 null，\n"
             "  failed_attempts 为 0。\n"
+            "set_lockout_policy:\n"
+            "  为已登记用户按用户设置锁定策略，仅接收 operation、user_id、\n"
+            "  max_failed_attempts（1..10 的 JSON 整数）与 lock_duration\n"
+            "  （1..300 的 JSON 整数秒）；布尔值不视为整数。每用户至多保存\n"
+            "  一份策略，相同配置重复提交逐字节一致，新值完整替换旧值且不改变\n"
+            "  其他状态或事件轨迹。策略只作用于此后的 authenticate_stateful、\n"
+            "  authenticate_session 与 reauthenticate_session，无状态\n"
+            "  authenticate 保持不变：账户未锁定时错误口令先使失败次数加一，\n"
+            "  达到或超过当时配置的 max_failed_attempts 时把 locked_until 设为\n"
+            "  now+lock_duration，仍返回 denied/invalid_password；降低阈值不立即\n"
+            "  锁定或清零已有失败次数，下一次错误口令才按新阈值判断；正确口令\n"
+            "  仍清零失败次数。已锁定账户继续使用原 locked_until，配置变化不\n"
+            "  缩短或延长本次锁定，到期后的下一次认证才采用新策略。未配置用户\n"
+            "  仍在第三次失败后锁定 300 秒。引用未知用户整批 unknown_user\n"
+            "  （退出码 5）；字段缺失、多余或 JSON 类型错误为 parameter_error\n"
+            "  （退出码 2），数值越界为 value_error（退出码 3）；整批先完成静态\n"
+            "  校验，任一操作异常时配置随整批回滚。结果固定键序为 operation、\n"
+            "  user_id、status、max_failed_attempts、lock_duration，status 为\n"
+            "  configured。\n"
             "authenticate_session:\n"
             "  沿用 authenticate_stateful 的凭据校验、时间单调性、失败计数与\n"
             "  锁定语义；accepted 时创建内存会话，expires_at=now+lifetime，\n"
