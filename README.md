@@ -150,6 +150,26 @@
     错误仍为 `parameter_error`（退出码 2）。
   * 结果固定键序为 operation、user_id、status、event_count、events，
     status 为 reported。
+* `list_accounting_events`：为指定会话返回本进程当前批次内已提交的计费
+  轨迹，仅接收 operation 和 session_id。
+  * `authenticate_session` 成功创建会话时产生且仅产生一条 start 事件，
+    `now` 取该请求显式传入值、reason 为 null；口令拒绝、账户锁定、并发
+    上限拒绝与整批异常均不产生 start 事件。
+  * `validate_session`、`check_admission` 或 `terminate_session` 首次将
+    已有会话判为终态时追加且仅追加一条 stop 事件：主动终止取首次
+    `terminated_at`、reason 为 `session_terminated`；首次观察到硬过期取
+    触发结果的 `now`、reason 为 `session_expired`；首次观察到空闲过期取
+    触发 `now`、reason 为 `session_idle_expired`。重复校验、重复终止或
+    从另一入口再次观察同一终态不改写、不追加；尚未被这些入口观察到的
+    超时不由查询推断。
+  * 每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条
+    stop；事件按 sequence 升序，固定键序为 sequence、event_type、now、
+    reason。查询只读：不推进用户或会话时间、不生成事件，重复查询返回
+    逐字节相同内容；事件不含口令、盐或编码凭据。每会话至多保存两条
+    计费事件，单次查询的时间与额外内存均为常数上界。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）。
+  * 结果固定键序为 operation、session_id、user_id、status、event_count、
+    events，status 为 reported。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
