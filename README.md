@@ -189,6 +189,32 @@
   * 中间计费只推进会话最近已提交时间，不刷新活动时间，不延长空闲或硬期限，
     也不改变认证、准入和并发上限状态。
   * 结果固定键序为 operation、session_id、user_id、status、reason、sequence。
+* `reauthenticate_session`：凭终态源会话的归属与口令创建替代会话，接收
+  operation、source_session_id、session_id、password、`now`、`lifetime`；
+  字段约束同 `authenticate_session`（source_session_id 同 session_id 规则），
+  `now` 须显式注入，不读取系统时间。
+  * 先按既有优先级判定源会话：未知源会话整批 `unknown_session`（退出码 8）；
+    `now` 早于源会话最近已提交时间或该用户最近已提交认证时间整批
+    `state_error`（退出码 6）。
+  * 源会话在 `now` 下仍有效（未终止、未达硬期限、未达空闲期限）时返回
+    denied/session_active、`expires_at` 为 null：不校验口令、不刷新活动
+    时间、不修改源会话，也不产生任何事件。
+  * 源会话已主动终止、已硬过期、已空闲过期或本次首次达到超时（先硬期限
+    后空闲期限）时，首次观察到超时只追加一条 stop 计费事件（时间取本次
+    `now`），源会话记录与终态原因不变；随后按 `authenticate_stateful` 的
+    失败计数、锁定与解锁语义校验所属用户口令：口令错误返回
+    denied/invalid_password，锁定期间返回 denied/account_locked。
+  * 口令正确后新 session_id 已存在（含终态记录）整批 `duplicate_session`
+    （退出码 7）；再按既有规则检查并发上限，达到上限返回
+    denied/session_limit_reached、`expires_at` 为 null；否则创建新会话，
+    `expires_at = now + lifetime`，快照当前空闲超时配置，追加且仅追加一条
+    start 计费事件。
+  * 进入再次认证或并发上限判定（即除 session_active 与整批异常外的普通
+    结果）时，认证轨迹追加 source 为 reauthenticate_session、携带新
+    session_id 的一条事件。
+  * 结果固定键序为 operation、source_session_id、session_id、user_id、
+    status、reason、expires_at；成功时 status 为 accepted、reason 为
+    null、expires_at 为新过期时刻，拒绝时 expires_at 为 null。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
