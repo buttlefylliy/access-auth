@@ -33,6 +33,26 @@
     `state_error`（退出码 6）。
   * 结果键序固定为 operation、user_id、status、reason、failed_attempts、
     locked_until；成功时 reason 为 null，未锁定时 locked_until 为 null。
+* `unlock_account`：对已登记用户执行确定性的人工解锁。接收 user_id、`now`，
+  字段沿用 `authenticate_stateful` 的字符、整数与取值约束（`now` 为
+  0..9007199254740991 的 JSON 整数，显式注入，不读取系统时间），不校验口令。
+  * 成功后将该用户的 `failed_attempts` 归零、`locked_until` 置为 null，并把
+    `now` 记为最近已提交的认证状态时间；无论调用前处于锁定、只有累计失败、
+    锁定已自然到期，还是本来就是干净状态，都返回同一个幂等结果；以相同 `now`
+    重复提交时输出逐字节一致。
+  * 服从该用户现有的时间单调规则：`now` 早于最近已提交认证状态时间时整批
+    `state_error`（退出码 6），相等时间允许执行；未知 user_id 整批
+    `unknown_user`（退出码 5）。字段缺失、额外字段或 JSON 类型错误沿用
+    `parameter_error`（退出码 2），长度或数值越界沿用 `value_error`（退出码 3）。
+  * 只改变目标用户后续有状态认证与会话认证所读取的失败计数和锁定值：不修改
+    编码凭据、无状态 `authenticate` 的结果、既有会话及其超时、并发限额、准入
+    策略、认证事件和计费事件；不留下认证或计费事件。原有的自动到期解锁、锁定
+    期间拒绝及成功认证清零语义继续保留；人工解锁后的新失败从一次重新累计。
+  * 失败路径不清除计数、锁定截止值或推进时间；整批静态校验完成前不变更状态，
+    本操作或同批后续操作异常时解锁效果随整批一起回滚。
+  * 结果固定键序为 operation、user_id、status、reason、failed_attempts、
+    locked_until；status 为 unlocked，reason 与 locked_until 为 null，
+    failed_attempts 为 0。
 * `authenticate_session`：有状态认证通过后创建确定性会话。接收 user_id、
   password、session_id、`now`、`lifetime`，沿用 `authenticate_stateful` 的
   凭据校验、用户时间单调性、失败计数与锁定语义。

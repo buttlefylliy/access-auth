@@ -3,9 +3,10 @@
 
 本文件既是用户注册表的实现，也是命令行入口。命令行从标准输入读取一个
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
-authenticate_stateful / authenticate_session / validate_session /
-terminate_session / set_session_limit / set_admission_policy /
-set_admission_default / set_admission_overrides / check_admission /
+authenticate_stateful / unlock_account / authenticate_session /
+validate_session / terminate_session / set_session_limit /
+set_admission_policy / set_admission_default /
+set_admission_overrides / check_admission /
 set_session_idle_timeout / list_authentication_events /
 list_accounting_events / record_accounting_interim /
 reauthenticate_session 操作，
@@ -66,6 +67,7 @@ EXIT_UNKNOWN_SESSION = 8
 _OPERATION_REGISTER = "register"
 _OPERATION_AUTHENTICATE = "authenticate"
 _OPERATION_AUTHENTICATE_STATEFUL = "authenticate_stateful"
+_OPERATION_UNLOCK_ACCOUNT = "unlock_account"
 _OPERATION_AUTHENTICATE_SESSION = "authenticate_session"
 _OPERATION_VALIDATE_SESSION = "validate_session"
 _OPERATION_TERMINATE_SESSION = "terminate_session"
@@ -86,6 +88,11 @@ _REQUIRED_KEYS = {
         "operation",
         "user_id",
         "password",
+        "now",
+    ),
+    _OPERATION_UNLOCK_ACCOUNT: (
+        "operation",
+        "user_id",
         "now",
     ),
     _OPERATION_AUTHENTICATE_SESSION: (
@@ -225,6 +232,15 @@ class UserRegistry:
     另为 authenticate_stateful 维护每用户的认证状态
     (last_now, failed_attempts, locked_until)，值为不可变元组，
     不保留认证历史。
+
+    unlock_account 对已登记用户执行确定性的人工解锁：服从该用户既有的
+    时间单调规则（now 早于最近已提交认证状态时间时抛出
+    StateRegressionError，相等允许），随后无条件将 failed_attempts
+    归零、locked_until 置为 None，并把 now 记为最近已提交的认证状态
+    时间；无论调用前处于锁定、只有累计失败、锁定已自然到期还是干净
+    状态，都提交同一个幂等状态 (now, 0, None)。人工解锁不校验口令、
+    不修改编码凭据，也不产生认证或计费事件；解锁后的新失败从一次
+    重新累计。未知用户抛出 UnknownUserError。
 
     会话仅驻留内存：session_id -> (user_id, expires_at, last_check,
     terminated_at, idle_timeout, last_activity, idle_expired)，其中
@@ -438,6 +454,27 @@ class UserRegistry:
             locked_until = now + LOCK_DURATION_SECONDS
         self._states[user_id] = (now, failed_attempts, locked_until)
         return ("denied", "invalid_password", failed_attempts, locked_until)
+
+    def unlock_account(self, user_id, now):
+        """对已登记用户执行确定性的人工解锁。
+
+        将该用户状态无条件提交为 (now, 0, None)：failed_attempts 归零、
+        locked_until 置为 None，并把 now 记为最近已提交的认证状态时间。
+        无论调用前处于锁定、只有累计失败、锁定已自然到期还是干净状态，
+        结果相同且以相同 now 重复提交逐字节一致。服从该用户既有的时间
+        单调规则：now 早于最近已提交认证状态时间时抛出
+        StateRegressionError，状态不变（相等时间允许执行）。
+        不校验口令、不修改编码凭据，也不产生认证或计费事件。
+        未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        last_now, _failed_attempts, _locked_until = self._states.get(
+            user_id, (None, 0, None)
+        )
+        if last_now is not None and now < last_now:
+            raise StateRegressionError(user_id, now, last_now)
+        self._states[user_id] = (now, 0, None)
 
     def authenticate_session(self, user_id, password, session_id, now, lifetime):
         """有状态认证通过后创建确定性会话。
@@ -1076,7 +1113,8 @@ def _validate_operation(index, operation):
             "parameter_error",
             index,
             "field 'operation' must be 'register', 'authenticate', "
-            "'authenticate_stateful', 'authenticate_session', "
+            "'authenticate_stateful', 'unlock_account', "
+            "'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
             "'set_admission_overrides', 'check_admission', "
@@ -1104,6 +1142,7 @@ def _validate_operation(index, operation):
         _OPERATION_REGISTER,
         _OPERATION_AUTHENTICATE,
         _OPERATION_AUTHENTICATE_STATEFUL,
+        _OPERATION_UNLOCK_ACCOUNT,
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_SET_SESSION_LIMIT,
         _OPERATION_SET_ADMISSION_POLICY,
@@ -1166,6 +1205,7 @@ def _validate_operation(index, operation):
 
     if kind in (
         _OPERATION_AUTHENTICATE_STATEFUL,
+        _OPERATION_UNLOCK_ACCOUNT,
         _OPERATION_AUTHENTICATE_SESSION,
         _OPERATION_VALIDATE_SESSION,
         _OPERATION_TERMINATE_SESSION,
@@ -1545,6 +1585,37 @@ def run_batch(registry, operations):
                 status,
                 reason,
                 None,
+            )
+        elif kind == _OPERATION_UNLOCK_ACCOUNT:
+            user_id = op["user_id"]
+            try:
+                working.unlock_account(user_id, op["now"])
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            except StateRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for user: %s"
+                    % (exc.now, exc.last_now, exc.user_id),
+                    EXIT_STATE_ERROR,
+                )
+            # 人工解锁不校验口令、不产生认证或计费事件；所有起始状态
+            # （锁定、累计失败、锁定已自然到期、干净状态）均返回同一结果。
+            results.append(
+                {
+                    "operation": _OPERATION_UNLOCK_ACCOUNT,
+                    "user_id": user_id,
+                    "status": "unlocked",
+                    "reason": None,
+                    "failed_attempts": 0,
+                    "locked_until": None,
+                }
             )
         elif kind == _OPERATION_AUTHENTICATE_SESSION:
             user_id = op["user_id"]
@@ -2048,9 +2119,10 @@ def _build_parser():
         description=(
             "从标准输入读取一个 UTF-8 JSON 文档，按顺序执行 operations 数组中的\n"
             "register / authenticate / authenticate_stateful /\n"
-            "authenticate_session / validate_session / terminate_session /\n"
-            "set_session_limit / set_admission_policy / set_admission_default /\n"
-            "set_admission_overrides / check_admission / set_session_idle_timeout /\n"
+            "unlock_account / authenticate_session / validate_session /\n"
+            "terminate_session / set_session_limit / set_admission_policy /\n"
+            "set_admission_default / set_admission_overrides /\n"
+            "check_admission / set_session_idle_timeout /\n"
             "list_authentication_events / list_accounting_events /\n"
             "record_accounting_interim / reauthenticate_session 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
@@ -2091,6 +2163,21 @@ def _build_parser():
             "  denied/account_locked 且不计数；now 到达截止值后先解锁再校验。\n"
             "  口令正确返回 accepted 并清零计数与截止值。同一用户的 now 不得\n"
             "  早于上次已提交时间（相等合法），否则整批 state_error。\n"
+            "unlock_account:\n"
+            "  对已登记用户执行确定性的人工解锁，接收 user_id 与 now，字段约束\n"
+            "  同 authenticate_stateful（now 显式注入，不读取系统时间），不校验\n"
+            "  口令。now 早于该用户最近已提交认证状态时间时整批 state_error\n"
+            "  （退出码 6，状态不变，相等时间允许）；未知用户整批 unknown_user\n"
+            "  （退出码 5）。成功后 failed_attempts 归零、locked_until 置为\n"
+            "  null，并把 now 记为最近已提交认证状态时间；无论调用前处于锁定、\n"
+            "  只有累计失败、锁定已自然到期还是干净状态，都返回同一个幂等结果，\n"
+            "  以相同 now 重复提交逐字节一致。人工解锁不修改编码凭据、不影响\n"
+            "  无状态 authenticate、既有会话及其超时、并发限额与准入策略，也不\n"
+            "  产生认证或计费事件；解锁后的新失败从一次重新累计，原有的自动到期\n"
+            "  解锁、锁定期间拒绝与成功认证清零语义保持不变。结果固定键序为\n"
+            "  operation、user_id、status、reason、failed_attempts、\n"
+            "  locked_until；status 为 unlocked，reason 与 locked_until 为 null，\n"
+            "  failed_attempts 为 0。\n"
             "authenticate_session:\n"
             "  沿用 authenticate_stateful 的凭据校验、时间单调性、失败计数与\n"
             "  锁定语义；accepted 时创建内存会话，expires_at=now+lifetime，\n"
