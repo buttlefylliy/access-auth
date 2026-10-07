@@ -9,7 +9,7 @@ set_admission_policy / set_admission_default /
 set_admission_overrides / check_admission /
 set_session_idle_timeout / list_authentication_events /
 list_accounting_events / record_accounting_interim /
-reauthenticate_session 操作，
+reauthenticate_session / get_account_status 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -81,6 +81,7 @@ _OPERATION_LIST_AUTHENTICATION_EVENTS = "list_authentication_events"
 _OPERATION_LIST_ACCOUNTING_EVENTS = "list_accounting_events"
 _OPERATION_RECORD_ACCOUNTING_INTERIM = "record_accounting_interim"
 _OPERATION_REAUTHENTICATE_SESSION = "reauthenticate_session"
+_OPERATION_GET_ACCOUNT_STATUS = "get_account_status"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -165,6 +166,11 @@ _REQUIRED_KEYS = {
         "password",
         "now",
         "lifetime",
+    ),
+    _OPERATION_GET_ACCOUNT_STATUS: (
+        "operation",
+        "user_id",
+        "now",
     ),
 }
 
@@ -315,6 +321,11 @@ class UserRegistry:
     expires_at = now + lifetime 创建新会话（快照当前空闲超时配置）并
     追加一条 start 事件；进入再次认证或并发上限判定的普通结果追加
     source 为 reauthenticate_session、携带新 session_id 的认证事件。
+
+    get_account_status 为已登记用户提供只读的认证状态查询：不校验口令，
+    按注入的 now 报告 locked/unlocked、失败计数、锁定截止值与最近一次
+    已提交认证状态时间；锁定自然到期只按自动到期语义报告，不提交状态
+    变化，不推进时间、不触碰会话，也不产生认证或计费事件。
     """
 
     def __init__(self):
@@ -475,6 +486,35 @@ class UserRegistry:
         if last_now is not None and now < last_now:
             raise StateRegressionError(user_id, now, last_now)
         self._states[user_id] = (now, 0, None)
+
+    def get_account_status(self, user_id, now):
+        """只读查询账户认证状态，不提交任何变化。
+
+        返回 (status, failed_attempts, locked_until, last_authentication_at)，
+        其中 last_authentication_at 为该用户最近一次已提交认证状态操作的
+        now（从未进行有状态认证或人工解锁时为 None）。保存的 locked_until
+        非空且 now 小于该值时报告 ("locked", 原失败计数, 原锁定截止值)；
+        now 已达到或超过该值时按现有自动到期语义报告
+        ("unlocked", 0, None)，但不改写保存的状态；其余未锁定状态报告
+        ("unlocked", 当前累计失败次数, None)。服从该用户既有的时间单调
+        规则：now 早于最近已提交认证状态时间时抛出 StateRegressionError
+        （相等时间允许查询）。不推进 last_authentication_at，不创建、刷新
+        或终止会话，也不追加认证或计费事件；单次查询的时间与额外内存为
+        常数上界。未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        last_now, failed_attempts, locked_until = self._states.get(
+            user_id, (None, 0, None)
+        )
+        if last_now is not None and now < last_now:
+            raise StateRegressionError(user_id, now, last_now)
+        if locked_until is not None:
+            if now < locked_until:
+                return ("locked", failed_attempts, locked_until, last_now)
+            # 锁定已自然到期：按自动到期语义报告，但不提交状态变化。
+            return ("unlocked", 0, None, last_now)
+        return ("unlocked", failed_attempts, None, last_now)
 
     def authenticate_session(self, user_id, password, session_id, now, lifetime):
         """有状态认证通过后创建确定性会话。
@@ -1120,7 +1160,8 @@ def _validate_operation(index, operation):
             "'set_admission_overrides', 'check_admission', "
             "'set_session_idle_timeout', "
             "'list_authentication_events', 'list_accounting_events', "
-            "'record_accounting_interim' or 'reauthenticate_session'",
+            "'record_accounting_interim', 'reauthenticate_session' or "
+            "'get_account_status'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -1150,6 +1191,7 @@ def _validate_operation(index, operation):
         _OPERATION_SET_ADMISSION_OVERRIDES,
         _OPERATION_SET_SESSION_IDLE_TIMEOUT,
         _OPERATION_LIST_AUTHENTICATION_EVENTS,
+        _OPERATION_GET_ACCOUNT_STATUS,
     )
     if needs_user:
         user_id = _validate_string_field(operation, "user_id", index)
@@ -1212,6 +1254,7 @@ def _validate_operation(index, operation):
         _OPERATION_CHECK_ADMISSION,
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_REAUTHENTICATE_SESSION,
+        _OPERATION_GET_ACCOUNT_STATUS,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
@@ -1615,6 +1658,43 @@ def run_batch(registry, operations):
                     "reason": None,
                     "failed_attempts": 0,
                     "locked_until": None,
+                }
+            )
+        elif kind == _OPERATION_GET_ACCOUNT_STATUS:
+            user_id = op["user_id"]
+            try:
+                (
+                    status,
+                    failed_attempts,
+                    locked_until,
+                    last_authentication_at,
+                ) = working.get_account_status(user_id, op["now"])
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            except StateRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for user: %s"
+                    % (exc.now, exc.last_now, exc.user_id),
+                    EXIT_STATE_ERROR,
+                )
+            # 只读查询：不改写认证状态、不推进 last_authentication_at、
+            # 不触碰会话，也不追加认证或计费事件；在副本上查询即可反映
+            # 本批先前已提交的状态，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_GET_ACCOUNT_STATUS,
+                    "user_id": user_id,
+                    "status": status,
+                    "failed_attempts": failed_attempts,
+                    "locked_until": locked_until,
+                    "last_authentication_at": last_authentication_at,
                 }
             )
         elif kind == _OPERATION_AUTHENTICATE_SESSION:
@@ -2124,7 +2204,8 @@ def _build_parser():
             "set_admission_default / set_admission_overrides /\n"
             "check_admission / set_session_idle_timeout /\n"
             "list_authentication_events / list_accounting_events /\n"
-            "record_accounting_interim / reauthenticate_session 操作，\n"
+            "record_accounting_interim / reauthenticate_session /\n"
+            "get_account_status 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -2382,6 +2463,23 @@ def _build_parser():
             "  user_id、status、reason、expires_at；成功时 status 为 accepted、\n"
             "  reason 为 null、expires_at 为新过期时刻，拒绝时 expires_at 为\n"
             "  null。\n"
+            "get_account_status:\n"
+            "  无需提交口令即可查看已登记账户的认证状态，仅接收 operation、\n"
+            "  user_id 与 now；user_id 与 now 沿用 authenticate_stateful 的\n"
+            "  类型、字符、长度、整数范围和显式时钟约束，不读取系统时间。\n"
+            "  last_authentication_at 为该用户最近一次已提交认证状态操作的\n"
+            "  now，从未进行有状态认证或人工解锁时为 null。保存的 locked_until\n"
+            "  非空且 now 小于该值时 status 为 locked，并原样返回失败计数与\n"
+            "  锁定截止值；now 已达到或超过该值时按现有自动到期语义报告\n"
+            "  status 为 unlocked、failed_attempts 为 0、locked_until 为\n"
+            "  null；其余未锁定状态也报告 unlocked，并返回当前累计失败次数和\n"
+            "  null。查询只读：不改写认证状态或推进 last_authentication_at，\n"
+            "  不创建、刷新或终止会话，也不追加认证及计费事件；观察到锁定到期\n"
+            "  后，后续认证仍由原入口按既有规则提交实际状态变化。now 早于该\n"
+            "  用户最近已提交认证状态时间时整批 state_error（退出码 6），相等\n"
+            "  时间允许查询；未知 user_id 整批 unknown_user（退出码 5）。结果\n"
+            "  固定键序为 operation、user_id、status、failed_attempts、\n"
+            "  locked_until、last_authentication_at。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"

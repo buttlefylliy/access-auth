@@ -255,6 +255,24 @@
   * 结果固定键序为 operation、source_session_id、session_id、user_id、
     status、reason、expires_at；成功时 status 为 accepted、reason 为
     null、expires_at 为新过期时刻，拒绝时 expires_at 为 null。
+* `get_account_status`：无需提交口令即可查看已登记账户的认证状态，仅接收
+  operation、user_id、`now`；user_id 与 `now` 沿用 `authenticate_stateful`
+  的类型、字符、长度、整数范围和显式时钟约束，不读取系统时间。
+  * `last_authentication_at` 表示该用户最近一次已提交认证状态操作的
+    `now`，从未进行有状态认证或人工解锁时为 null。若保存的 locked_until
+    非空且 `now` 小于该值，status 为 locked，并原样返回失败计数和锁定
+    截止值；若 `now` 已达到或超过该值，则按现有自动到期语义报告 status
+    为 unlocked、failed_attempts 为 0、locked_until 为 null；其余未锁定
+    状态也报告 unlocked，并返回当前累计失败次数和 null。
+  * 查询只读：不得改写认证状态或推进 last_authentication_at，不得创建、
+    刷新或终止会话，也不得追加认证及计费事件。观察到锁定到期后，后续
+    认证仍由原入口按既有规则提交实际状态变化。
+  * `now` 早于该用户最近已提交认证状态时间时整批 `state_error`（退出码
+    6），相等时间允许查询；未知 user_id 整批 `unknown_user`（退出码 5）。
+    字段缺失、额外字段或 JSON 类型错误沿用 `parameter_error`（退出码 2），
+    长度、控制字符或数值越界沿用 `value_error`（退出码 3）。
+  * 结果固定键序为 operation、user_id、status、failed_attempts、
+    locked_until、last_authentication_at。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
