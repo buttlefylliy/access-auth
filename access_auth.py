@@ -7,7 +7,7 @@ authenticate_stateful / authenticate_session / validate_session /
 terminate_session / set_session_limit / set_admission_policy /
 set_admission_default / check_admission / set_session_idle_timeout /
 list_authentication_events / list_accounting_events /
-record_accounting_interim 操作，
+record_accounting_interim / reauthenticate_session 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -75,6 +75,7 @@ _OPERATION_SET_SESSION_IDLE_TIMEOUT = "set_session_idle_timeout"
 _OPERATION_LIST_AUTHENTICATION_EVENTS = "list_authentication_events"
 _OPERATION_LIST_ACCOUNTING_EVENTS = "list_accounting_events"
 _OPERATION_RECORD_ACCOUNTING_INTERIM = "record_accounting_interim"
+_OPERATION_REAUTHENTICATE_SESSION = "reauthenticate_session"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -141,6 +142,14 @@ _REQUIRED_KEYS = {
         "operation",
         "session_id",
         "now",
+    ),
+    _OPERATION_REAUTHENTICATE_SESSION: (
+        "operation",
+        "source_session_id",
+        "session_id",
+        "password",
+        "now",
+        "lifetime",
     ),
 }
 
@@ -469,6 +478,119 @@ class UserRegistry:
         # 成功创建会话：追加且仅追加一条 start 计费事件，时间取请求 now。
         self._accounting_events[session_id] = [("start", now, None)]
         return ("accepted", None, expires_at)
+
+    def reauthenticate_session(
+        self, source_session_id, session_id, password, now, lifetime
+    ):
+        """凭终态源会话的归属与口令创建替代会话。
+
+        返回 (status, reason, user_id, expires_at)。未知源会话抛出
+        UnknownSessionError；新 session_id 已存在（含已过期的终态记录）
+        抛出 DuplicateSessionError；now 早于源会话最近已提交时间抛出
+        SessionTimeRegressionError，早于所属用户最近已提交的认证时间抛出
+        StateRegressionError；上述异常均不改变任何状态。
+
+        先按既有优先级判定源会话：已主动终止、已置空闲过期终态、
+        now 达到 expires_at（硬过期）、启用了空闲超时的会话 now 达到
+        最近活动时间+idle_timeout（空闲过期）均为终态。源会话在 now 下
+        仍有效时返回 denied/session_active，不校验口令、不刷新活动时间，
+        也不提交任何时间或事件。
+
+        源会话已处终态或首次达到超时时，按 authenticate_stateful 的失败
+        计数、锁定与解锁语义校验所属用户：口令错误返回
+        denied/invalid_password，锁定期间返回 denied/account_locked；
+        口令正确后按 authenticate_session 的同一口径检查并发上限，达到
+        上限返回 denied/session_limit_reached（正确口令清零失败计数的
+        效果仍提交）；否则以新 session_id 创建会话，
+        expires_at = now + lifetime，并快照该用户当前的空闲超时配置、
+        以创建 now 作为首次活动时间。源会话记录及其终态原因不被修改；
+        本操作首次观察到源会话硬过期或空闲过期时只追加一条 stop 计费
+        事件（重复观察幂等），创建成功只为新会话追加一条 start 事件。
+        """
+        record = self._sessions.get(source_session_id)
+        if record is None:
+            raise UnknownSessionError(source_session_id)
+        if session_id in self._sessions:
+            raise DuplicateSessionError(session_id)
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+        ) = record
+        if last_check is not None and now < last_check:
+            raise SessionTimeRegressionError(source_session_id, now, last_check)
+        # 用户认证时间单调性在此显式检查：session_active 短路不进入
+        # authenticate_stateful，也须保证 now 不早于用户最近已提交时间。
+        last_auth_now = self._states.get(user_id, (None, 0, None))[0]
+        if last_auth_now is not None and now < last_auth_now:
+            raise StateRegressionError(user_id, now, last_auth_now)
+        if (
+            terminated_at is None
+            and not idle_expired
+            and now < expires_at
+            and not self._idle_expired_now(idle_timeout, last_activity, now)
+        ):
+            # 源会话仍有效：不校验口令、不刷新活动时间、不提交任何状态。
+            return ("denied", "session_active", user_id, None)
+        if terminated_at is None and not idle_expired:
+            # 首次观察到源会话超时：只追加一条 stop 计费事件（幂等），
+            # 硬期限优先于空闲期限，与既有会话入口的判定顺序一致。
+            if now >= expires_at:
+                self._record_accounting_stop(
+                    source_session_id, now, "session_expired"
+                )
+            else:
+                self._record_accounting_stop(
+                    source_session_id, now, "session_idle_expired"
+                )
+        status, reason, _failed_attempts, _locked_until = (
+            self.authenticate_stateful(user_id, password, now)
+        )
+        if status != "accepted":
+            return ("denied", reason, user_id, None)
+        limit = self._session_limits.get(user_id)
+        if limit is not None:
+            active = 0
+            for (
+                session_user_id,
+                other_expires_at,
+                _last_check,
+                other_terminated_at,
+                other_idle_timeout,
+                other_last_activity,
+                other_idle_expired,
+            ) in self._sessions.values():
+                if (
+                    session_user_id != user_id
+                    or other_terminated_at is not None
+                    or now >= other_expires_at
+                    or other_idle_expired
+                    or (
+                        other_idle_timeout
+                        and now >= other_last_activity + other_idle_timeout
+                    )
+                ):
+                    continue
+                active += 1
+            if active >= limit:
+                return ("denied", "session_limit_reached", user_id, None)
+        new_expires_at = now + lifetime
+        self._sessions[session_id] = (
+            user_id,
+            new_expires_at,
+            None,
+            None,
+            self._idle_timeouts.get(user_id, 0),
+            now,
+            False,
+        )
+        # 成功创建替代会话：只为新会话追加一条 start 计费事件。
+        self._accounting_events[session_id] = [("start", now, None)]
+        return ("accepted", None, user_id, new_expires_at)
 
     def set_session_limit(self, user_id, max_sessions):
         """为已登记用户设置并发会话上限；重复设置相同值幂等，新值覆盖旧值。
@@ -912,8 +1034,8 @@ def _validate_operation(index, operation):
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
             "'check_admission', 'set_session_idle_timeout', "
-            "'list_authentication_events', 'list_accounting_events' or "
-            "'record_accounting_interim'",
+            "'list_authentication_events', 'list_accounting_events', "
+            "'record_accounting_interim' or 'reauthenticate_session'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -966,6 +1088,7 @@ def _validate_operation(index, operation):
         _OPERATION_AUTHENTICATE,
         _OPERATION_AUTHENTICATE_STATEFUL,
         _OPERATION_AUTHENTICATE_SESSION,
+        _OPERATION_REAUTHENTICATE_SESSION,
     ):
         password = _validate_string_field(operation, "password", index)
         password_bytes = len(password.encode("utf-8"))
@@ -1000,6 +1123,7 @@ def _validate_operation(index, operation):
         _OPERATION_TERMINATE_SESSION,
         _OPERATION_CHECK_ADMISSION,
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
+        _OPERATION_REAUTHENTICATE_SESSION,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
@@ -1015,32 +1139,46 @@ def _validate_operation(index, operation):
         _OPERATION_CHECK_ADMISSION,
         _OPERATION_LIST_ACCOUNTING_EVENTS,
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
+        _OPERATION_REAUTHENTICATE_SESSION,
     ):
-        session_id = _validate_string_field(operation, "session_id", index)
-        if not (
-            SESSION_ID_MIN_LENGTH <= len(session_id) <= SESSION_ID_MAX_LENGTH
-        ):
-            raise BatchError(
-                "value_error",
-                index,
-                "session_id must be %d..%d Unicode code points, got %d"
-                % (
-                    SESSION_ID_MIN_LENGTH,
-                    SESSION_ID_MAX_LENGTH,
-                    len(session_id),
-                ),
-                EXIT_VALUE_ERROR,
+        session_id_keys = ["session_id"]
+        if kind == _OPERATION_REAUTHENTICATE_SESSION:
+            session_id_keys.insert(0, "source_session_id")
+        for session_id_key in session_id_keys:
+            session_id = _validate_string_field(
+                operation, session_id_key, index
             )
-        if not _is_control_free(session_id):
-            raise BatchError(
-                "value_error",
-                index,
-                "session_id must not contain control characters",
-                EXIT_VALUE_ERROR,
-            )
-        validated["session_id"] = session_id
+            if not (
+                SESSION_ID_MIN_LENGTH
+                <= len(session_id)
+                <= SESSION_ID_MAX_LENGTH
+            ):
+                raise BatchError(
+                    "value_error",
+                    index,
+                    "%s must be %d..%d Unicode code points, got %d"
+                    % (
+                        session_id_key,
+                        SESSION_ID_MIN_LENGTH,
+                        SESSION_ID_MAX_LENGTH,
+                        len(session_id),
+                    ),
+                    EXIT_VALUE_ERROR,
+                )
+            if not _is_control_free(session_id):
+                raise BatchError(
+                    "value_error",
+                    index,
+                    "%s must not contain control characters"
+                    % session_id_key,
+                    EXIT_VALUE_ERROR,
+                )
+            validated[session_id_key] = session_id
 
-    if kind == _OPERATION_AUTHENTICATE_SESSION:
+    if kind in (
+        _OPERATION_AUTHENTICATE_SESSION,
+        _OPERATION_REAUTHENTICATE_SESSION,
+    ):
         lifetime = _validate_integer_field(operation, "lifetime", index)
         if not (LIFETIME_MIN <= lifetime <= LIFETIME_MAX):
             raise BatchError(
@@ -1559,6 +1697,73 @@ def run_batch(registry, operations):
                     "sequence": sequence,
                 }
             )
+        elif kind == _OPERATION_REAUTHENTICATE_SESSION:
+            source_session_id = op["source_session_id"]
+            session_id = op["session_id"]
+            try:
+                status, reason, session_user_id, expires_at = (
+                    working.reauthenticate_session(
+                        source_session_id,
+                        session_id,
+                        op["password"],
+                        op["now"],
+                        op["lifetime"],
+                    )
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % source_session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except DuplicateSessionError:
+                raise BatchError(
+                    "duplicate_session",
+                    index,
+                    "session already exists: %s" % session_id,
+                    EXIT_DUPLICATE_SESSION,
+                )
+            except SessionTimeRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for session: %s"
+                    % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            except StateRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for user: %s"
+                    % (exc.now, exc.last_now, exc.user_id),
+                    EXIT_STATE_ERROR,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_REAUTHENTICATE_SESSION,
+                    "source_session_id": source_session_id,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": status,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                }
+            )
+            # 进入再次认证或并发上限判定的普通结果（accepted、
+            # invalid_password、account_locked、session_limit_reached）
+            # 各追加一条携带新 session_id 的事件；session_active 与整批
+            # 异常不记事件。
+            if reason != "session_active":
+                working.append_authentication_event(
+                    session_user_id,
+                    _OPERATION_REAUTHENTICATE_SESSION,
+                    op["now"],
+                    status,
+                    reason,
+                    session_id,
+                )
         else:
             session_id = op["session_id"]
             try:
@@ -1681,7 +1886,7 @@ def _build_parser():
             "set_session_limit / set_admission_policy / set_admission_default /\n"
             "check_admission / set_session_idle_timeout /\n"
             "list_authentication_events / list_accounting_events /\n"
-            "record_accounting_interim 操作，\n"
+            "record_accounting_interim / reauthenticate_session 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -1879,10 +2084,29 @@ def _build_parser():
             "  轨迹不变。中间计费只推进会话最近已提交时间，不刷新活动时间，不\n"
             "  延长空闲或硬期限，也不改变认证、准入与并发上限状态。结果固定键序\n"
             "  为 operation、session_id、user_id、status、reason、sequence。\n"
+            "reauthenticate_session:\n"
+            "  凭原会话归属和口令为终态会话创建替代会话，接收 source_session_id、\n"
+            "  session_id、password、now、lifetime，字段约束同 authenticate_session，\n"
+            "  now 须显式注入、不读取系统时间。先按既有优先级判定源会话：源会话在\n"
+            "  now 下仍有效时返回 denied/session_active，不校验口令、不刷新活动\n"
+            "  时间；源会话已主动终止、硬过期、空闲过期或首次达到超时时，按\n"
+            "  authenticate_stateful 的失败计数、锁定与解锁语义校验所属用户：口令\n"
+            "  错误返回 denied/invalid_password，锁定期间返回 denied/account_locked；\n"
+            "  口令正确后检查并发上限，达到上限返回 denied/session_limit_reached，\n"
+            "  否则以新 session_id 创建会话，expires_at=now+lifetime，并快照当前\n"
+            "  空闲超时配置；源会话及其终态原因不变。未知源会话整批\n"
+            "  unknown_session，新标识已存在整批 duplicate_session，now 早于源会话\n"
+            "  最近已提交时间或用户最近认证时间整批 state_error；异常不留部分状态。\n"
+            "  本操作首次观察到源会话超时时只追加一条 stop 计费事件，创建成功只\n"
+            "  追加一条 start 事件；进入再次认证或并发上限判定时，认证轨迹追加\n"
+            "  source 为 reauthenticate_session 且携带新 session_id 的事件，\n"
+            "  session_active 与整批异常不记事件。结果固定键序为 operation、\n"
+            "  source_session_id、session_id、user_id、status、reason、expires_at。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
-            "      session_limit_reached、accounting_interim_limit_reached、\n"
+            "      session_limit_reached、session_active、\n"
+            "      accounting_interim_limit_reached、\n"
             "      policy_not_configured、policy_denied 与终止结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
             "  3  value_error：长度、salt 编码、now/lifetime 范围、规则数量、\n"
