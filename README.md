@@ -99,16 +99,43 @@
   * 引用未知用户整批 `unknown_user`（退出码 5）。
   * 结果键序固定为 operation、user_id、status、default_action，status 为
     configured。
+* `set_admission_overrides`：为已登记用户配置有序准入覆盖规则，接收
+  user_id、`rules`。
+  * `rules` 是最多 64 项的 JSON 数组，每项只能含 `port_id`、`vlan_id`、
+    `action`；`port_id` 可为 null 或沿用现有端口标识约束（1..64 个无控制
+    字符 (Cc) 的 Unicode 码点），`vlan_id` 可为 null 或 1..4094 的 JSON
+    整数，null 表示该维度通配；`action` 只能是 `allow` 或 `deny`。规则按
+    数组顺序匹配，允许相同匹配对或重叠通配，首条匹配生效。
+  * 覆盖只在 `check_admission` 的会话有效性判定之后使用：按数组顺序采用
+    首条匹配的规则，allow 返回 accepted 且 reason 为 null，deny 返回
+    denied/policy_denied；未命中则继续精确规则和默认动作判定。覆盖不改变
+    终止、硬过期和空闲过期的既有优先级，不改变有效会话检查时间和活动时间
+    的刷新规则（覆盖 allow/deny 也算活动），不产生认证或计费事件。
+  * 新数组完整替换旧值并保留顺序，相同内容重复提交幂等，空数组表示清除；
+    每用户最多保存 64 条覆盖规则，单次准入最多顺序检查 64 条。覆盖不影响
+    精确规则、默认动作、凭据、认证状态、已有会话、并发限额或超时配置；未
+    配置时原有判定与输出保持不变。
+  * 引用未知用户整批 `unknown_user`（退出码 5）。`rules`、元素或非 null
+    字段类型错误，以及字段缺失或多余时报 `parameter_error`（退出码 2）；
+    数组超限、端口或 VLAN 越界、action 非法报 `value_error`（退出码 3）。
+    全部规则通过校验后才能改变状态，本批后续操作失败时覆盖配置随其他状态
+    回滚。
+  * 结果键序固定为 operation、user_id、status、rule_count，status 为
+    configured。
 * `check_admission`：按注入时间检查会话有效性并按所属用户策略判定端口准入，
   接收 session_id、`now`、`port_id`、`vlan_id`，字段约束同上；会话状态与
   时间单调语义同 `validate_session`。
   * 已终止的会话返回 denied/session_terminated；已过期的会话返回
-    denied/session_expired；活动会话按所属用户策略精确匹配
+    denied/session_expired；活动会话先按所属用户的有序覆盖规则
+    （`set_admission_overrides`）逐条匹配（`port_id` 或 `vlan_id` 为 null
+    表示该维度通配），采用首条匹配：allow 返回 accepted 且 reason 为 null，
+    deny 返回 denied/policy_denied；全部未命中时再精确匹配
     (port_id, vlan_id)：命中返回 accepted 且 reason 为 null；未命中时若该
     用户配置了默认准入动作，`allow` 返回 accepted 且 reason 为 null，
     `deny` 返回 denied/policy_denied；精确规则与默认动作均未配置返回
     denied/policy_not_configured；已配置精确规则（含空集）但未配置默认
-    动作且未命中返回 denied/policy_denied。
+    动作且未命中返回 denied/policy_denied。覆盖判定不改变终止、硬过期和
+    空闲过期的既有优先级，不产生认证或计费事件。
   * 正常判定均提交本次会话检查时间，异常则整批回滚；未知 session_id 整批
     `unknown_session`（退出码 8），时间回退整批 `state_error`（退出码 6）。
   * 结果键序固定为 operation、session_id、user_id、port_id、vlan_id、
@@ -219,8 +246,8 @@
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额、准入策略、默认准入动作、空闲超时配置、认证事件轨迹与计费事件
-轨迹恢复到批次
+会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、认证事件
+轨迹与计费事件轨迹恢复到批次
 开始前，普通
 拒绝、会话过期、
 空闲过期与会话终止作为成功结果提交。未知用户报
