@@ -13,7 +13,7 @@ set_session_idle_timeout / list_authentication_events /
 list_accounting_events / list_admission_events /
 record_accounting_interim /
 reauthenticate_session / get_account_status / get_session_status /
-report_session_disconnect / list_session_trace 操作，
+report_session_disconnect / list_session_trace / list_users 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -97,6 +97,7 @@ _OPERATION_GET_ACCOUNT_STATUS = "get_account_status"
 _OPERATION_GET_SESSION_STATUS = "get_session_status"
 _OPERATION_REPORT_SESSION_DISCONNECT = "report_session_disconnect"
 _OPERATION_LIST_SESSION_TRACE = "list_session_trace"
+_OPERATION_LIST_USERS = "list_users"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_REPLACE_CREDENTIAL: ("operation", "user_id", "password", "salt"),
@@ -211,6 +212,9 @@ _REQUIRED_KEYS = {
     _OPERATION_LIST_SESSION_TRACE: (
         "operation",
         "session_id",
+    ),
+    _OPERATION_LIST_USERS: (
+        "operation",
     ),
 }
 
@@ -431,6 +435,12 @@ class UserRegistry:
     其余返回 active、reason 为 None。即使 now 达到硬期限或空闲期限，也
     不写入终态、不推进会话最近已提交时间、不刷新 last_activity，也不追加
     认证或计费事件；不影响并发计数、准入策略、凭据与账户锁定。
+
+    list_users 为只读查询：返回当前已登记用户的 user_id 列表，按各用户
+    首次成功 register 的提交先后排列（凭据存储本身保持插入序，
+    replace_credential 的就地替换不改变位置）。不读取时钟、不推进任何
+    用户或会话时间，也不追加认证、准入、计费或会话轨迹；结果不含口令、
+    盐、编码凭据、摘要、失败次数、锁定截止值、策略内容或会话标识。
     """
 
     def __init__(self):
@@ -610,6 +620,15 @@ class UserRegistry:
         if user_id in self._credentials:
             raise DuplicateUserError(user_id)
         self._credentials[user_id] = encode_credential(password, salt)
+
+    def list_users(self):
+        """返回当前已登记用户 user_id 的只读副本（按首次登记提交顺序）。
+
+        凭据存储保持插入序：首次成功 register 决定位置，replace_credential
+        的就地替换、认证、解锁与各类策略配置都不改变排列。不修改任何状态、
+        不推进任何时间，也不产生事件；时间与新增内存均以当前用户数线性为界。
+        """
+        return list(self._credentials)
 
     def replace_credential(self, user_id, password, salt):
         """完整替换已登记用户的编码凭据；salt 为 16 字节。
@@ -1629,7 +1648,8 @@ def _validate_operation(index, operation):
             "'list_admission_events', "
             "'record_accounting_interim', 'reauthenticate_session', "
             "'get_account_status', 'get_session_status' or "
-            "'report_session_disconnect', 'list_session_trace'",
+            "'report_session_disconnect', 'list_session_trace', "
+            "'list_users'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -2894,6 +2914,19 @@ def run_batch(registry, operations):
                 reason,
                 disconnected_at=disconnected_at,
             )
+        elif kind == _OPERATION_LIST_USERS:
+            users = working.list_users()
+            # 只读：不读取时钟、不推进任何时间、不改变状态、不追加事件；
+            # 在副本上查询即可反映本批先前已成功登记的提交顺序，看不见
+            # 位于其后的登记，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_LIST_USERS,
+                    "status": "reported",
+                    "user_count": len(users),
+                    "users": users,
+                }
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -3034,7 +3067,7 @@ def _build_parser():
             "list_admission_events /\n"
             "record_accounting_interim / reauthenticate_session /\n"
             "get_account_status / get_session_status /\n"
-            "report_session_disconnect / list_session_trace 操作，\n"
+            "report_session_disconnect / list_session_trace / list_users 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -3422,6 +3455,21 @@ def _build_parser():
             "  value_error（退出码 3）。结果固定键序为 operation、\n"
             "  session_id、user_id、status、event_count、events，status 为\n"
             "  reported。\n"
+            "list_users:\n"
+            "  只读查询当前已登记用户集合，仅接收 operation 字段（缺少\n"
+            "  operation、含额外字段或 operation 不是 JSON 字符串时整批\n"
+            "  parameter_error，退出码 2）。users 按各用户首次成功 register\n"
+            "  在本批中的提交先后排列；replace_credential、认证、解锁与各类\n"
+            "  策略配置都不改变顺序。初始空注册表返回 user_count 0 与空数组。\n"
+            "  查询能看见同一批中位于它之前且已成功登记的用户，看不见位于\n"
+            "  其后的登记；整批后续任一操作失败时注册表回滚到批次开始前，\n"
+            "  只输出既有错误对象。查询不读取时钟、不推进任何用户或会话\n"
+            "  时间，也不追加认证、准入、计费或会话轨迹；结果不含口令、盐、\n"
+            "  编码凭据、摘要、失败次数、锁定截止值、策略内容或会话标识。\n"
+            "  相同状态下重复查询逐字节一致；受每批最多 1000 个操作限制，\n"
+            "  返回数组至多 1000 个 user_id，查询时间与新增内存以当前用户\n"
+            "  数线性为界。结果固定键序为 operation、status、user_count、\n"
+            "  users，status 为 reported。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
