@@ -11,7 +11,8 @@ set_admission_overrides / check_admission /
 set_session_idle_timeout / list_authentication_events /
 list_accounting_events / list_admission_events /
 record_accounting_interim /
-reauthenticate_session / get_account_status / get_session_status 操作，
+reauthenticate_session / get_account_status / get_session_status /
+report_session_disconnect 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -87,6 +88,7 @@ _OPERATION_RECORD_ACCOUNTING_INTERIM = "record_accounting_interim"
 _OPERATION_REAUTHENTICATE_SESSION = "reauthenticate_session"
 _OPERATION_GET_ACCOUNT_STATUS = "get_account_status"
 _OPERATION_GET_SESSION_STATUS = "get_session_status"
+_OPERATION_REPORT_SESSION_DISCONNECT = "report_session_disconnect"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_REPLACE_CREDENTIAL: ("operation", "user_id", "password", "salt"),
@@ -187,6 +189,11 @@ _REQUIRED_KEYS = {
         "session_id",
         "now",
     ),
+    _OPERATION_REPORT_SESSION_DISCONNECT: (
+        "operation",
+        "session_id",
+        "now",
+    ),
 }
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -264,17 +271,25 @@ class UserRegistry:
     重新累计。未知用户抛出 UnknownUserError。
 
     会话仅驻留内存：session_id -> (user_id, expires_at, last_check,
-    terminated_at, idle_timeout, last_activity, idle_expired)，其中
+    terminated_at, idle_timeout, last_activity, idle_expired,
+    disconnected_at)，其中
     last_check 为最近已提交的检查/终止时间（创建时为 None），terminated_at
     为首次终止时间（未终止为 None）；idle_timeout 为创建时快照的用户空闲
     超时（0 表示关闭），last_activity 为最近活动时间（创建时为创建 now，
     仅 validate_session / check_admission 对仍有效会话完成判定后刷新），
-    idle_expired 为空闲过期终态标志。
+    idle_expired 为空闲过期终态标志，disconnected_at 为首次异常断线时间
+    （未断线为 None）。
     会话过期与终止都是终态：记录保留在表中直至进程结束，重复创建同 id
     仍判为重复，过期后重复校验仍返回 session_expired，终止后校验一律
     返回 session_terminated，重复终止幂等返回首次 terminated_at。
     空闲过期同样是终态：命中后两个检查入口一律返回 session_idle_expired，
     terminate_session 也返回该原因且 terminated_at 为 null。
+    异常断线也是终态：report_session_disconnect 对仍有效会话记录首次
+    disconnected_at 并追加一条 reason 为 session_disconnected 的 stop
+    计费事件；此后 validate_session、check_admission、terminate_session
+    与 record_accounting_interim 一律返回 denied/session_disconnected，
+    不刷新活动时间、不追加 interim，并发计数排除该会话；重复报告幂等
+    返回首次 disconnected_at，不重复追加事件。
 
     另维护每用户并发会话上限 _session_limits（user_id -> int）；未配置的
     用户不限并发。上限只约束 authenticate_session 创建新会话：在本次
@@ -341,7 +356,8 @@ class UserRegistry:
 
     reauthenticate_session 凭终态源会话的归属与口令创建替代会话：源会话
     仍有效时返回 denied/session_active（不校验口令、不刷新活动时间、不
-    修改源会话、不记事件）；源会话已终止、已硬过期、已空闲过期或本次
+    修改源会话、不记事件）；源会话已终止、已硬过期、已空闲过期、已异常
+    断线或本次
     首次达到超时时，首次观察到超时只追加一条 stop 计费事件，源会话记录
     与终态原因不变，随后按 authenticate_stateful 语义校验所属用户口令，
     口令正确后检查新 session_id 重复与并发上限，通过则以
@@ -358,8 +374,10 @@ class UserRegistry:
     会话既有的时间单调规则（now 早于最近已提交时间抛出
     SessionTimeRegressionError，相等允许）。按既有优先级判定：主动终止
     标记存在时返回 terminated/session_terminated；已为空闲过期终态时
-    返回 expired/session_idle_expired；否则 now 达到 expires_at 时返回
-    expired/session_expired；硬期限未到但空闲超时启用且 now 达到
+    返回 expired/session_idle_expired；已异常断线时返回
+    disconnected/session_disconnected 并公开 disconnected_at；否则
+    now 达到 expires_at 时返回 expired/session_expired；硬期限未到但
+    空闲超时启用且 now 达到
     last_activity + idle_timeout 时返回 expired/session_idle_expired；
     其余返回 active、reason 为 None。即使 now 达到硬期限或空闲期限，也
     不写入终态、不推进会话最近已提交时间、不刷新 last_activity，也不追加
@@ -608,7 +626,8 @@ class UserRegistry:
         若该用户已配置并发上限，则在口令被接受且 session_id 未使用后检查
         容量：本次 now 下属于该用户、未终止且 now 小于 expires_at 的会话
         计入并发（已过期会话保留记录但不计入）；已达到空闲期限（含已置
-        空闲终态）的会话同样不计入，计数不刷新任何会话的活动时间。
+        空闲终态）或已异常断线的会话同样不计入，计数不刷新任何会话的
+        活动时间。
         活动数达到上限时返回
         denied/session_limit_reached、expires_at 为 None，不创建会话，
         正确口令清零失败计数的效果仍提交。降低上限不终止已有会话。
@@ -634,10 +653,12 @@ class UserRegistry:
                 idle_timeout,
                 last_activity,
                 idle_expired,
+                disconnected_at,
             ) in self._sessions.values():
                 if (
                     session_user_id != user_id
                     or terminated_at is not None
+                    or disconnected_at is not None
                     or now >= expires_at
                     or idle_expired
                     or (
@@ -659,6 +680,7 @@ class UserRegistry:
             idle_timeout,
             now,
             False,
+            None,
         )
         # 成功创建会话：追加且仅追加一条 start 计费事件，时间取请求 now。
         self._accounting_events[session_id] = [("start", now, None)]
@@ -672,9 +694,10 @@ class UserRegistry:
         返回 (status, reason, user_id, expires_at)。先按既有优先级判定源
         会话：未知源会话抛出 UnknownSessionError；now 早于源会话最近已
         提交时间抛出 SessionTimeRegressionError，状态不变。源会话在 now
-        下仍有效（未终止、未达硬期限、未达空闲期限）时返回
+        下仍有效（未终止、未达硬期限、未达空闲期限、未异常断线）时返回
         denied/session_active：不校验口令、不刷新活动时间、不修改源会话，
-        也不产生任何事件。源会话已主动终止、已硬过期、已空闲过期或本次
+        也不产生任何事件。源会话已主动终止、已硬过期、已空闲过期、已异常
+        断线或本次
         首次达到超时（先硬期限后空闲期限）时，首次观察到超时只追加一条
         stop 计费事件（幂等，时间取本次 now），源会话记录与终态原因不变；
         随后按 authenticate_stateful 的失败计数、锁定与解锁语义校验所属
@@ -700,10 +723,11 @@ class UserRegistry:
             idle_timeout,
             last_activity,
             idle_expired,
+            disconnected_at,
         ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(source_session_id, now, last_check)
-        if terminated_at is None and not idle_expired:
+        if terminated_at is None and not idle_expired and disconnected_at is None:
             if now >= expires_at:
                 # 首次观察到硬过期：只追加一条 stop，源会话记录不变。
                 self._record_accounting_stop(
@@ -735,10 +759,12 @@ class UserRegistry:
                 session_idle_timeout,
                 session_last_activity,
                 session_idle_expired,
+                session_disconnected_at,
             ) in self._sessions.values():
                 if (
                     session_user_id != user_id
                     or session_terminated_at is not None
+                    or session_disconnected_at is not None
                     or now >= session_expires_at
                     or session_idle_expired
                     or (
@@ -760,6 +786,7 @@ class UserRegistry:
             new_idle_timeout,
             now,
             False,
+            None,
         )
         # 成功创建替代会话：追加且仅追加一条 start 计费事件，时间取请求 now。
         self._accounting_events[session_id] = [("start", now, None)]
@@ -835,7 +862,8 @@ class UserRegistry:
         时间单调语义同 validate_session：now 早于该会话最近已提交的检查
         时间时抛出 SessionTimeRegressionError，状态不变；已终止的会话
         一律返回 denied/session_terminated；已处于空闲过期终态的会话一律
-        返回 denied/session_idle_expired；否则先判断 now >= expires_at
+        返回 denied/session_idle_expired；已异常断线的会话一律返回
+        denied/session_disconnected；否则先判断 now >= expires_at
         返回 denied/session_expired，再判断启用了空闲超时的会话
         now >= last_activity + idle_timeout，命中则置空闲过期终态并返回
         denied/session_idle_expired。仍有效的会话先按所属用户的有序覆盖
@@ -864,32 +892,39 @@ class UserRegistry:
             idle_timeout,
             last_activity,
             idle_expired,
+            disconnected_at,
         ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
         if terminated_at is not None:
             self._sessions[session_id] = (
                 user_id, expires_at, now, terminated_at,
-                idle_timeout, last_activity, idle_expired,
+                idle_timeout, last_activity, idle_expired, disconnected_at,
             )
             return ("denied", "session_terminated", user_id)
         if idle_expired:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             return ("denied", "session_idle_expired", user_id)
+        if disconnected_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False, disconnected_at,
+            )
+            return ("denied", "session_disconnected", user_id)
         if now >= expires_at:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, False,
+                idle_timeout, last_activity, False, None,
             )
             self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             self._record_accounting_stop(
                 session_id, now, "session_idle_expired"
@@ -897,7 +932,7 @@ class UserRegistry:
             return ("denied", "session_idle_expired", user_id)
         # 会话仍有效：提交检查时间并刷新最近活动时间。
         self._sessions[session_id] = (
-            user_id, expires_at, now, None, idle_timeout, now, False,
+            user_id, expires_at, now, None, idle_timeout, now, False, None,
         )
         # 有序覆盖规则优先于精确规则与默认动作：按顺序采用首条匹配项。
         for rule_port_id, rule_vlan_id, rule_action in (
@@ -930,7 +965,8 @@ class UserRegistry:
         now 早于该会话最近已提交的检查时间时抛出 SessionTimeRegressionError，
         状态不变（相等时间允许重复检查）；已终止的会话一律返回
         denied/session_terminated；已处于空闲过期终态的会话一律返回
-        denied/session_idle_expired；否则先判断硬期限：now >= expires_at
+        denied/session_idle_expired；已异常断线的会话一律返回
+        denied/session_disconnected；否则先判断硬期限：now >= expires_at
         返回 denied/session_expired，过期为终态，过期时刻不被刷新；
         再判断启用了空闲超时的会话 now >= last_activity + idle_timeout，
         命中则置空闲过期终态并返回 denied/session_idle_expired；
@@ -949,32 +985,39 @@ class UserRegistry:
             idle_timeout,
             last_activity,
             idle_expired,
+            disconnected_at,
         ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
         if terminated_at is not None:
             self._sessions[session_id] = (
                 user_id, expires_at, now, terminated_at,
-                idle_timeout, last_activity, idle_expired,
+                idle_timeout, last_activity, idle_expired, disconnected_at,
             )
             return ("denied", "session_terminated", user_id, expires_at)
         if idle_expired:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             return ("denied", "session_idle_expired", user_id, expires_at)
+        if disconnected_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False, disconnected_at,
+            )
+            return ("denied", "session_disconnected", user_id, expires_at)
         if now >= expires_at:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, False,
+                idle_timeout, last_activity, False, None,
             )
             self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id, expires_at)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             self._record_accounting_stop(
                 session_id, now, "session_idle_expired"
@@ -982,7 +1025,7 @@ class UserRegistry:
             return ("denied", "session_idle_expired", user_id, expires_at)
         # 会话仍有效：提交检查时间并刷新最近活动时间。
         self._sessions[session_id] = (
-            user_id, expires_at, now, None, idle_timeout, now, False,
+            user_id, expires_at, now, None, idle_timeout, now, False, None,
         )
         return ("accepted", None, user_id, expires_at)
 
@@ -994,7 +1037,9 @@ class UserRegistry:
         SessionTimeRegressionError，状态不变（相等时间允许重复调用）；
         已终止的会话幂等返回首次 terminated_at，不改写终止时间；
         已处于空闲过期终态的会话返回 denied/session_idle_expired 且
-        terminated_at 为 null；now >= expires_at 时会话保持过期终态，返回
+        terminated_at 为 null；已异常断线的会话返回
+        denied/session_disconnected 且 terminated_at 为 null；
+        now >= expires_at 时会话保持过期终态，返回
         denied/session_expired、terminated_at 为 null，不留下终止标记；
         启用了空闲超时的会话 now >= last_activity + idle_timeout 时置空闲
         过期终态，返回 denied/session_idle_expired、terminated_at 为 null；
@@ -1013,34 +1058,43 @@ class UserRegistry:
             idle_timeout,
             last_activity,
             idle_expired,
+            disconnected_at,
         ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
         if terminated_at is not None:
             self._sessions[session_id] = (
                 user_id, expires_at, now, terminated_at,
-                idle_timeout, last_activity, idle_expired,
+                idle_timeout, last_activity, idle_expired, disconnected_at,
             )
             return ("terminated", None, user_id, terminated_at, expires_at)
         if idle_expired:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             return (
                 "denied", "session_idle_expired", user_id, None, expires_at,
             )
+        if disconnected_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False, disconnected_at,
+            )
+            return (
+                "denied", "session_disconnected", user_id, None, expires_at,
+            )
         if now >= expires_at:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, False,
+                idle_timeout, last_activity, False, None,
             )
             self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id, None, expires_at)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             self._record_accounting_stop(
                 session_id, now, "session_idle_expired"
@@ -1049,19 +1103,100 @@ class UserRegistry:
                 "denied", "session_idle_expired", user_id, None, expires_at,
             )
         self._sessions[session_id] = (
-            user_id, expires_at, now, now, idle_timeout, last_activity, False,
+            user_id, expires_at, now, now, idle_timeout, last_activity,
+            False, None,
         )
         self._record_accounting_stop(session_id, now, "session_terminated")
         return ("terminated", None, user_id, now, expires_at)
+
+    def report_session_disconnect(self, session_id, now):
+        """按注入时间把有效会话标记为异常断线（终态）。
+
+        返回 (status, reason, user_id, disconnected_at, expires_at) 并提交
+        本次时间：now 早于该会话最近已提交的时间时抛出
+        SessionTimeRegressionError，状态不变（相等时间允许重复调用）；
+        未知会话抛出 UnknownSessionError。保持既有终态优先级：已主动终止、
+        已空闲过期，或本次 now 已达到硬期限或空闲期限时，不写断线标记，
+        分别返回 denied/session_terminated、denied/session_idle_expired
+        或 denied/session_expired（disconnected_at 为 None），首次观察到
+        超时仍只追加一条 stop 计费事件。会话仍有效时记录首次
+        disconnected_at=now，返回 disconnected、reason 为 None，并追加
+        一条时间为 now、reason 为 session_disconnected 的 stop 计费事件；
+        重复报告已断线会话时保留首次 disconnected_at，幂等返回且不重复
+        追加事件。断线不刷新活动时间，不改变用户认证状态或其他会话。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        (
+            user_id,
+            expires_at,
+            last_check,
+            terminated_at,
+            idle_timeout,
+            last_activity,
+            idle_expired,
+            disconnected_at,
+        ) = record
+        if last_check is not None and now < last_check:
+            raise SessionTimeRegressionError(session_id, now, last_check)
+        if terminated_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, terminated_at,
+                idle_timeout, last_activity, idle_expired, disconnected_at,
+            )
+            return ("denied", "session_terminated", user_id, None, expires_at)
+        if idle_expired:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True, None,
+            )
+            return (
+                "denied", "session_idle_expired", user_id, None, expires_at,
+            )
+        if disconnected_at is not None:
+            # 重复报告：保留首次断线时间，不重复追加 stop 事件。
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False, disconnected_at,
+            )
+            return ("disconnected", None, user_id, disconnected_at, expires_at)
+        if now >= expires_at:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False, None,
+            )
+            self._record_accounting_stop(session_id, now, "session_expired")
+            return ("denied", "session_expired", user_id, None, expires_at)
+        if self._idle_expired_now(idle_timeout, last_activity, now):
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, True, None,
+            )
+            self._record_accounting_stop(
+                session_id, now, "session_idle_expired"
+            )
+            return (
+                "denied", "session_idle_expired", user_id, None, expires_at,
+            )
+        # 会话仍有效：记录首次断线时间并追加一条 stop 计费事件。
+        self._sessions[session_id] = (
+            user_id, expires_at, now, None, idle_timeout, last_activity,
+            False, now,
+        )
+        self._record_accounting_stop(session_id, now, "session_disconnected")
+        return ("disconnected", None, user_id, now, expires_at)
 
     def record_accounting_interim(self, session_id, now):
         """按注入时间为有效会话写入一条中间计费点。
 
         返回 (status, reason, user_id, sequence)：now 早于该会话最近已提交
         时间时抛出 SessionTimeRegressionError，轨迹与时间状态不变；未知会话
-        抛出 UnknownSessionError。已主动终止、已空闲过期或已硬过期的会话不
+        抛出 UnknownSessionError。已主动终止、已空闲过期、已异常断线或已
+        硬过期的会话不
         追加 interim，分别返回 denied/session_terminated、
-        denied/session_idle_expired 或 denied/session_expired，sequence 为
+        denied/session_idle_expired、denied/session_disconnected 或
+        denied/session_expired，sequence 为
         None；本次首次观察到硬过期或空闲过期时仍只追加一条 stop，时间取本次
         now。活动会话提交成功时追加 ("interim", now, None) 并返回新事件
         编号；同一会话以相同 now 重复提交时返回原编号、不重复追加。每个会话
@@ -1081,32 +1216,39 @@ class UserRegistry:
             idle_timeout,
             last_activity,
             idle_expired,
+            disconnected_at,
         ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
         if terminated_at is not None:
             self._sessions[session_id] = (
                 user_id, expires_at, now, terminated_at,
-                idle_timeout, last_activity, idle_expired,
+                idle_timeout, last_activity, idle_expired, disconnected_at,
             )
             return ("denied", "session_terminated", user_id, None)
         if idle_expired:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             return ("denied", "session_idle_expired", user_id, None)
+        if disconnected_at is not None:
+            self._sessions[session_id] = (
+                user_id, expires_at, now, None,
+                idle_timeout, last_activity, False, disconnected_at,
+            )
+            return ("denied", "session_disconnected", user_id, None)
         if now >= expires_at:
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, False,
+                idle_timeout, last_activity, False, None,
             )
             self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id, None)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
-                idle_timeout, last_activity, True,
+                idle_timeout, last_activity, True, None,
             )
             self._record_accounting_stop(
                 session_id, now, "session_idle_expired"
@@ -1115,7 +1257,7 @@ class UserRegistry:
         # 会话仍有效：只推进最近已提交时间，不刷新最近活动时间。
         self._sessions[session_id] = (
             user_id, expires_at, now, None,
-            idle_timeout, last_activity, False,
+            idle_timeout, last_activity, False, None,
         )
         events = self._accounting_events[session_id]
         if events and events[-1][0] == "interim" and events[-1][1] == now:
@@ -1136,15 +1278,18 @@ class UserRegistry:
         """只读查询会话状态，不提交任何状态变化。
 
         返回 (status, reason, user_id, expires_at, terminated_at,
-        idle_timeout, last_activity_at)。未知会话抛出 UnknownSessionError；
+        idle_timeout, last_activity_at, disconnected_at)。未知会话抛出
+        UnknownSessionError；
         now 早于该会话最近已提交时间时抛出 SessionTimeRegressionError
         （相等允许），状态不变。按既有优先级判定：主动终止标记存在时返回
         terminated/session_terminated；已处于空闲过期终态时返回
-        expired/session_idle_expired；否则 now 达到 expires_at 时返回
+        expired/session_idle_expired；已异常断线时返回
+        disconnected/session_disconnected；否则 now 达到 expires_at 时返回
         expired/session_expired；硬期限未到但空闲超时启用且 now 达到
         last_activity + idle_timeout 时返回 expired/session_idle_expired；
         其余返回 active、reason 为 None。未主动终止时 terminated_at 为
-        None，空闲超时关闭时 idle_timeout 为 0，时间值取自保存状态。
+        None，未异常断线时 disconnected_at 为 None，空闲超时关闭时
+        idle_timeout 为 0，时间值取自保存状态。
         查询不写入终态、不推进最近已提交时间、不刷新活动时间，也不追加
         认证或计费事件；即使 now 达到硬期限或空闲期限，后续校验、终止、
         计费中间点与再认证仍按既有语义首次提交终态。
@@ -1160,6 +1305,7 @@ class UserRegistry:
             idle_timeout,
             last_activity,
             idle_expired,
+            disconnected_at,
         ) = record
         if last_check is not None and now < last_check:
             raise SessionTimeRegressionError(session_id, now, last_check)
@@ -1172,6 +1318,7 @@ class UserRegistry:
                 terminated_at,
                 idle_timeout,
                 last_activity,
+                disconnected_at,
             )
         if idle_expired:
             return (
@@ -1182,6 +1329,18 @@ class UserRegistry:
                 None,
                 idle_timeout,
                 last_activity,
+                None,
+            )
+        if disconnected_at is not None:
+            return (
+                "disconnected",
+                "session_disconnected",
+                user_id,
+                expires_at,
+                None,
+                idle_timeout,
+                last_activity,
+                disconnected_at,
             )
         if now >= expires_at:
             return (
@@ -1192,6 +1351,7 @@ class UserRegistry:
                 None,
                 idle_timeout,
                 last_activity,
+                None,
             )
         if self._idle_expired_now(idle_timeout, last_activity, now):
             return (
@@ -1202,6 +1362,7 @@ class UserRegistry:
                 None,
                 idle_timeout,
                 last_activity,
+                None,
             )
         return (
             "active",
@@ -1211,6 +1372,7 @@ class UserRegistry:
             None,
             idle_timeout,
             last_activity,
+            None,
         )
 
 
@@ -1327,7 +1489,8 @@ def _validate_operation(index, operation):
             "'list_authentication_events', 'list_accounting_events', "
             "'list_admission_events', "
             "'record_accounting_interim', 'reauthenticate_session', "
-            "'get_account_status' or 'get_session_status'",
+            "'get_account_status', 'get_session_status' or "
+            "'report_session_disconnect'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -1424,6 +1587,7 @@ def _validate_operation(index, operation):
         _OPERATION_REAUTHENTICATE_SESSION,
         _OPERATION_GET_ACCOUNT_STATUS,
         _OPERATION_GET_SESSION_STATUS,
+        _OPERATION_REPORT_SESSION_DISCONNECT,
     ):
         now = _validate_now_type(index, operation)
         # now 沿用现有限制（0..MAX_NOW 且为锁定时长预留空间）；
@@ -1442,6 +1606,7 @@ def _validate_operation(index, operation):
         _OPERATION_RECORD_ACCOUNTING_INTERIM,
         _OPERATION_REAUTHENTICATE_SESSION,
         _OPERATION_GET_SESSION_STATUS,
+        _OPERATION_REPORT_SESSION_DISCONNECT,
     ):
         session_id = _validate_string_field(operation, "session_id", index)
         if not (
@@ -2332,6 +2497,7 @@ def run_batch(registry, operations):
                     terminated_at,
                     idle_timeout,
                     last_activity_at,
+                    disconnected_at,
                 ) = working.get_session_status(session_id, op["now"])
             except UnknownSessionError:
                 raise BatchError(
@@ -2361,6 +2527,43 @@ def run_batch(registry, operations):
                     "terminated_at": terminated_at,
                     "idle_timeout": idle_timeout,
                     "last_activity_at": last_activity_at,
+                    "disconnected_at": disconnected_at,
+                }
+            )
+        elif kind == _OPERATION_REPORT_SESSION_DISCONNECT:
+            session_id = op["session_id"]
+            try:
+                (
+                    status,
+                    reason,
+                    session_user_id,
+                    disconnected_at,
+                    expires_at,
+                ) = working.report_session_disconnect(session_id, op["now"])
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            except SessionTimeRegressionError as exc:
+                raise BatchError(
+                    "state_error",
+                    index,
+                    "now %d is before last committed now %d for session: %s"
+                    % (exc.now, exc.last_now, exc.session_id),
+                    EXIT_STATE_ERROR,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_REPORT_SESSION_DISCONNECT,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": status,
+                    "reason": reason,
+                    "disconnected_at": disconnected_at,
+                    "expires_at": expires_at,
                 }
             )
         else:
@@ -2490,7 +2693,8 @@ def _build_parser():
             "list_authentication_events / list_accounting_events /\n"
             "list_admission_events /\n"
             "record_accounting_interim / reauthenticate_session /\n"
-            "get_account_status / get_session_status 操作，\n"
+            "get_account_status / get_session_status /\n"
+            "report_session_disconnect 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -2760,10 +2964,12 @@ def _build_parser():
             "  now 须显式注入，不读取系统时间。先按既有优先级判定源会话：未知\n"
             "  源会话整批 unknown_session（退出码 8）；now 早于源会话最近已提交\n"
             "  时间或该用户最近已提交认证时间整批 state_error（退出码 6）。源会话\n"
-            "  在 now 下仍有效（未终止、未达硬期限、未达空闲期限）时返回\n"
+            "  在 now 下仍有效（未终止、未达硬期限、未达空闲期限、未异常\n"
+            "  断线）时返回\n"
             "  denied/session_active、expires_at 为 null：不校验口令、不刷新活动\n"
             "  时间、不修改源会话、不记事件。源会话已主动终止、已硬过期、已空闲\n"
-            "  过期或本次首次达到超时（先硬期限后空闲期限）时，首次观察到超时只\n"
+            "  过期、已异常断线或本次首次达到超时（先硬期限后空闲期限）时，首次\n"
+            "  观察到超时只\n"
             "  追加一条 stop 计费事件（时间取本次 now），源会话记录与终态原因\n"
             "  不变；随后按 authenticate_stateful 的失败计数、锁定与解锁语义校验\n"
             "  所属用户口令：口令错误返回 denied/invalid_password，锁定期间返回\n"
@@ -2798,7 +3004,8 @@ def _build_parser():
             "  只读查询会话状态，仅接收 operation、session_id 与 now，字段约束\n"
             "  同其他会话入口（now 显式注入，不读取系统时间）。按既有优先级\n"
             "  判定：主动终止标记存在时返回 terminated/session_terminated；\n"
-            "  已处于空闲过期终态时返回 expired/session_idle_expired；否则\n"
+            "  已处于空闲过期终态时返回 expired/session_idle_expired；已异常\n"
+            "  断线时返回 disconnected/session_disconnected；否则\n"
             "  now 达到 expires_at 时返回 expired/session_expired；硬期限未到\n"
             "  但空闲超时启用且 now 达到 最近活动时间+idle_timeout 时返回\n"
             "  expired/session_idle_expired；其余返回 active、reason 为 null。\n"
@@ -2810,12 +3017,33 @@ def _build_parser():
             "  state_error（退出码 6，相等时间允许）；未知 session_id 整批\n"
             "  unknown_session（退出码 8）。结果固定键序为 operation、\n"
             "  session_id、user_id、status、reason、expires_at、terminated_at、\n"
-            "  idle_timeout、last_activity_at。\n"
+            "  idle_timeout、last_activity_at、disconnected_at。\n"
+            "report_session_disconnect:\n"
+            "  把有效会话标记为异常断线（终态），仅接收 operation、session_id\n"
+            "  与 now，字段约束同其他会话入口，时间只取显式输入。未知\n"
+            "  session_id 整批 unknown_session（退出码 8）；now 早于该会话最近\n"
+            "  已提交时间时整批 state_error（退出码 6，相等时间允许）。保持既有\n"
+            "  终态优先级：已主动终止、已空闲过期，或本次 now 已达到硬期限或\n"
+            "  空闲期限时，不写断线标记，分别返回 denied/session_terminated、\n"
+            "  denied/session_idle_expired 或 denied/session_expired，\n"
+            "  disconnected_at 为 null，首次观察到超时仍只追加一条 stop 计费\n"
+            "  事件。会话仍有效时记录首次 disconnected_at=now，返回\n"
+            "  disconnected、reason 为 null，并追加一条时间为 now、reason 为\n"
+            "  session_disconnected 的 stop 计费事件；重复报告已断线会话时保留\n"
+            "  首次 disconnected_at，幂等返回且不重复追加事件。断线后\n"
+            "  validate_session、check_admission、terminate_session 与\n"
+            "  record_accounting_interim 均返回 denied/session_disconnected，\n"
+            "  不刷新活动时间、不追加 interim；get_session_status 返回\n"
+            "  disconnected/session_disconnected 并公开 disconnected_at；并发\n"
+            "  计数排除该会话；reauthenticate_session 可将已断线会话作为终态\n"
+            "  源会话创建替代会话。结果固定键序为 operation、session_id、\n"
+            "  user_id、status、reason、disconnected_at、expires_at。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"
             "      session_limit_reached、accounting_interim_limit_reached、\n"
-            "      session_active、policy_not_configured、policy_denied 与终止\n"
+            "      session_active、session_disconnected、\n"
+            "      policy_not_configured、policy_denied 与终止\n"
             "      结果）\n"
             "  2  parameter_error：JSON 语法或字段类型错误\n"
             "  3  value_error：长度、salt 编码、now/lifetime 范围、规则数量、\n"

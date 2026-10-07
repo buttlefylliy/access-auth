@@ -87,7 +87,8 @@
 * `validate_session`：按注入时间校验会话，接收 session_id、`now`。
   * 会话保存最近已提交的检查时间；`now` 早于该值整批 `state_error`（退出码 6），
     状态不变；相等时间允许重复检查。
-  * 已终止的会话一律 denied/session_terminated；否则 `now < expires_at`：
+  * 已终止的会话一律 denied/session_terminated；已异常断线的会话一律
+    denied/session_disconnected；否则 `now < expires_at`：
     accepted；`now >= expires_at`：denied/session_expired，过期为终态。
     检查不刷新过期时刻，也不改变用户认证状态，时间只取自输入。
     用户配置空闲超时后的判定与活动刷新语义见 `set_session_idle_timeout`。
@@ -99,6 +100,8 @@
     终止时间、expires_at 为原过期时刻；不改变用户失败计数、锁定状态或其他会话。
   * `now >= expires_at`：会话保持过期终态，返回 denied/session_expired、
     terminated_at 为 null，不留下终止标记。
+  * 已异常断线的会话返回 denied/session_disconnected、terminated_at
+    为 null，不留下终止标记。
   * 已终止的会话重复终止幂等返回首次 terminated_at，不改写终止时间；
     此后 `validate_session` 无论是否达到原过期时间都返回
     denied/session_terminated。
@@ -157,7 +160,8 @@
 * `check_admission`：按注入时间检查会话有效性并按所属用户策略判定端口准入，
   接收 session_id、`now`、`port_id`、`vlan_id`，字段约束同上；会话状态与
   时间单调语义同 `validate_session`。
-  * 已终止的会话返回 denied/session_terminated；已过期的会话返回
+  * 已终止的会话返回 denied/session_terminated；已异常断线的会话返回
+    denied/session_disconnected；已过期的会话返回
     denied/session_expired；活动会话先按所属用户的有序覆盖规则（见
     `set_admission_overrides`）采用首条匹配项，未命中时按所属用户策略
     精确匹配
@@ -217,7 +221,9 @@
     会话判为终态时追加且仅追加一条 stop 事件：主动终止取首次 terminated_at、
     reason 为 session_terminated；首次观察到硬过期取触发结果的 `now`、reason
     为 session_expired；首次观察到空闲过期取触发结果的 `now`、reason 为
-    session_idle_expired。重复校验、重复终止或从另一入口再次观察同一终态不改写
+    session_idle_expired；`report_session_disconnect` 首次标记异常断线时取
+    首次 disconnected_at、reason 为 session_disconnected。重复校验、重复终止、
+    重复报告断线或从另一入口再次观察同一终态不改写
     也不追加；尚未被这些入口观察到的超时不出现在轨迹中。
   * `record_accounting_interim` 对仍有效的会话追加 interim 事件，时间取该
     请求显式传入的 `now`，每个会话最多保存 64 条 interim。
@@ -256,9 +262,11 @@
   * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该会话
     最近已提交时间时整批 `state_error`（退出码 6）；两种异常均不改变轨迹或
     时间状态。
-  * 提交前仍按现有优先级判断终态与超时：已主动终止、已空闲过期或已硬过期
+  * 提交前仍按现有优先级判断终态与超时：已主动终止、已空闲过期、已异常
+    断线或已硬过期
     时不追加 interim，分别返回 denied/session_terminated、
-    denied/session_idle_expired 或 denied/session_expired，sequence 为 null；
+    denied/session_idle_expired、denied/session_disconnected 或
+    denied/session_expired，sequence 为 null；
     若本次首次观察到硬过期或空闲过期，仍只追加一个 stop，时间取本次 `now`。
   * 活动会话提交成功时 status 为 recorded、reason 为 null、sequence 为新
     事件编号；同一会话以相同 `now` 重复提交时返回原 sequence，不重复追加。
@@ -274,10 +282,12 @@
   * 先按既有优先级判定源会话：未知源会话整批 `unknown_session`（退出码 8）；
     `now` 早于源会话最近已提交时间或该用户最近已提交认证时间整批
     `state_error`（退出码 6）。
-  * 源会话在 `now` 下仍有效（未终止、未达硬期限、未达空闲期限）时返回
+  * 源会话在 `now` 下仍有效（未终止、未达硬期限、未达空闲期限、未异常
+    断线）时返回
     denied/session_active、`expires_at` 为 null：不校验口令、不刷新活动
     时间、不修改源会话，也不产生任何事件。
-  * 源会话已主动终止、已硬过期、已空闲过期或本次首次达到超时（先硬期限
+  * 源会话已主动终止、已硬过期、已空闲过期、已异常断线或本次首次达到
+    超时（先硬期限
     后空闲期限）时，首次观察到超时只追加一条 stop 计费事件（时间取本次
     `now`），源会话记录与终态原因不变；随后按 `authenticate_stateful` 的
     失败计数、锁定与解锁语义校验所属用户口令：口令错误返回
@@ -316,11 +326,13 @@
   整数，显式注入，不读取系统时间）。
   * 按既有优先级判定：主动终止标记存在时返回 terminated 和
     session_terminated；已为空闲过期终态时返回 expired 和
-    session_idle_expired；否则 `now` 达到 `expires_at` 时返回 expired 和
+    session_idle_expired；已异常断线时返回 disconnected 和
+    session_disconnected；否则 `now` 达到 `expires_at` 时返回 expired 和
     session_expired；硬期限未到但空闲超时启用且 `now` 达到
     `last_activity_at + idle_timeout` 时返回 expired 和
     session_idle_expired；其余返回 active，reason 为 null。
-  * 未主动终止时 terminated_at 为 null，空闲超时关闭时 idle_timeout 为 0，
+  * 未主动终止时 terminated_at 为 null，未异常断线时 disconnected_at
+    为 null，空闲超时关闭时 idle_timeout 为 0，
     时间值取自保存状态或确定性计算。
   * 查询只读：即使 `now` 达到硬期限或空闲期限，也不写入终态、不推进会话
     最近已提交时间、不刷新 `last_activity_at`，也不追加认证及计费事件；
@@ -332,7 +344,31 @@
     字段缺失、额外字段或 JSON 类型错误沿用 `parameter_error`（退出码 2），
     长度、控制字符或数值越界沿用 `value_error`（退出码 3）。
   * 结果固定键序为 operation、session_id、user_id、status、reason、
-    expires_at、terminated_at、idle_timeout、last_activity_at。
+    expires_at、terminated_at、idle_timeout、last_activity_at、
+    disconnected_at。
+* `report_session_disconnect`：把有效会话标记为异常断线（终态），仅接收
+  operation、session_id、`now`，字段约束沿用现有会话入口，时间只取显式
+  输入。
+  * 保持现有终态优先级：会话已主动终止、已空闲过期，或本次 `now` 已达到
+    硬期限或空闲期限时，不写断线标记，分别返回
+    denied/session_terminated、denied/session_idle_expired 或
+    denied/session_expired，disconnected_at 为 null；首次观察到超时仍只
+    生成一条 stop 计费事件。
+  * 会话仍有效时记录首次 disconnected_at=`now`，返回 disconnected 且
+    reason 为 null，并追加一条时间为 `now`、reason 为
+    session_disconnected 的 stop 计费事件；重复报告已断线会话时保留首次
+    disconnected_at，幂等返回且不重复追加事件。
+  * 断线后 `validate_session`、`check_admission`、`terminate_session`
+    和 `record_accounting_interim` 均返回 denied/session_disconnected，
+    不刷新活动时间、不追加 interim；`get_session_status` 返回
+    disconnected/session_disconnected 并公开 disconnected_at；并发计数
+    排除该会话；`reauthenticate_session` 可将已断线会话作为终态源会话，
+    沿用已有终态源的口令失败计数与锁定、重复会话标识、并发上限、空闲
+    配置快照、认证事件和 start 事件语义，源会话不变。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该
+    会话最近已提交时间时整批 `state_error`（退出码 6，相等时间允许）。
+  * 结果固定键序为 operation、session_id、user_id、status、reason、
+    disconnected_at、expires_at。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
