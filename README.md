@@ -151,18 +151,21 @@
   * 结果固定键序为 operation、user_id、status、event_count、events，
     status 为 reported。
 * `list_accounting_events`：为指定 session_id 返回本进程当前批次内已提交的
-  计费开始与停止事件，仅接收 operation 和 session_id。
+  计费开始、中间与停止事件，仅接收 operation 和 session_id。
   * `authenticate_session` 成功创建会话时产生且仅产生一条 start 事件，时间
     取该请求显式传入的 `now`；口令拒绝、账户锁定、并发上限拒绝与整批异常均
     不产生开始事件。
-  * `validate_session`、`check_admission` 或 `terminate_session` 首次将已有
+  * `validate_session`、`check_admission`、`terminate_session` 或
+    `record_accounting_interim` 首次将已有
     会话判为终态时追加且仅追加一条 stop 事件：主动终止取首次 terminated_at、
     reason 为 session_terminated；首次观察到硬过期取触发结果的 `now`、reason
     为 session_expired；首次观察到空闲过期取触发结果的 `now`、reason 为
     session_idle_expired。重复校验、重复终止或从另一入口再次观察同一终态不改写
     也不追加；尚未被这些入口观察到的超时不出现在轨迹中。
-  * 每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条 stop；
-    每个会话最多保存两条计费事件。
+  * `record_accounting_interim` 对仍有效的会话追加 interim 事件，时间取该
+    请求显式传入的 `now`，每个会话最多保存 64 条 interim。
+  * 每个会话的 sequence 从 1 连续递增，正常轨迹为一条 start、至多 64 条
+    interim 与至多一条 stop。
   * 查询只读：不推进用户或会话时间，也不生成事件；事件不含口令、盐或编码
     凭据；events 按 sequence 升序，每项固定键序为 sequence、event_type、
     now、reason。
@@ -170,6 +173,22 @@
     或类型错误仍为 `parameter_error`（退出码 2）。
   * 结果固定键序为 operation、session_id、user_id、status、event_count、
     events，status 为 reported。
+* `record_accounting_interim`：为有效会话写入一条中间计费点，仅接收
+  operation、session_id、`now`，字段约束沿用现有会话入口，时间只取显式输入。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；`now` 早于该会话
+    最近已提交时间时整批 `state_error`（退出码 6）；两种异常均不改变轨迹或
+    时间状态。
+  * 提交前仍按现有优先级判断终态与超时：已主动终止、已空闲过期或已硬过期
+    时不追加 interim，分别返回 denied/session_terminated、
+    denied/session_idle_expired 或 denied/session_expired，sequence 为 null；
+    若本次首次观察到硬过期或空闲过期，仍只追加一个 stop，时间取本次 `now`。
+  * 活动会话提交成功时 status 为 recorded、reason 为 null、sequence 为新
+    事件编号；同一会话以相同 `now` 重复提交时返回原 sequence，不重复追加。
+  * 每个会话最多保存 64 条 interim；达到上限后返回
+    denied/accounting_interim_limit_reached，sequence 为 null，且轨迹不变。
+  * 中间计费只推进会话最近已提交时间，不刷新活动时间，不延长空闲或硬期限，
+    也不改变认证、准入和并发上限状态。
+  * 结果固定键序为 operation、session_id、user_id、status、reason、sequence。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
