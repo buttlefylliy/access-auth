@@ -6,7 +6,7 @@ UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authentic
 authenticate_stateful / authenticate_session / validate_session /
 terminate_session / set_session_limit / set_admission_policy /
 set_admission_default / check_admission / set_session_idle_timeout /
-list_authentication_events 操作，
+list_authentication_events / list_accounting_events 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -71,6 +71,7 @@ _OPERATION_SET_ADMISSION_DEFAULT = "set_admission_default"
 _OPERATION_CHECK_ADMISSION = "check_admission"
 _OPERATION_SET_SESSION_IDLE_TIMEOUT = "set_session_idle_timeout"
 _OPERATION_LIST_AUTHENTICATION_EVENTS = "list_authentication_events"
+_OPERATION_LIST_ACCOUNTING_EVENTS = "list_accounting_events"
 _REQUIRED_KEYS = {
     _OPERATION_REGISTER: ("operation", "user_id", "password", "salt"),
     _OPERATION_AUTHENTICATE: ("operation", "user_id", "password"),
@@ -128,6 +129,10 @@ _REQUIRED_KEYS = {
     _OPERATION_LIST_AUTHENTICATION_EVENTS: (
         "operation",
         "user_id",
+    ),
+    _OPERATION_LIST_ACCOUNTING_EVENTS: (
+        "operation",
+        "session_id",
     ),
 }
 
@@ -233,6 +238,20 @@ class UserRegistry:
     authenticate_session 尝试；无状态 authenticate 不产生事件。每个用户的
     事件按提交顺序从 1 连续编号，事件不含口令、盐、编码凭据或摘要。轨迹随
     整批副本一起提交或回滚；只读查询 list_authentication_events 不追加事件。
+
+    另维护每会话计费轨迹 _accounting_events
+    （session_id -> list[(event_type, now, reason)]，至多两条）：
+    authenticate_session 成功创建会话时追加且仅追加一条 ("start", now, None)，
+    时间取该请求显式传入的 now；口令拒绝、账户锁定、并发上限拒绝与整批异常
+    均不产生开始事件。validate_session、check_admission 或 terminate_session
+    首次将已有会话判为终态时追加且仅追加一条 stop 事件：主动终止取首次
+    terminated_at、reason 为 session_terminated；首次观察到硬过期取触发结果
+    的 now、reason 为 session_expired；首次观察到空闲过期取触发结果的 now、
+    reason 为 session_idle_expired。重复校验、重复终止或从另一入口再次观察
+    同一终态不改写也不追加；尚未被这些入口观察到的超时不出现在轨迹中。
+    每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条 stop。
+    轨迹随整批副本一起提交或回滚；只读查询 list_accounting_events 不追加
+    事件、不推进任何时间。
     """
 
     def __init__(self):
@@ -244,6 +263,7 @@ class UserRegistry:
         self._admission_defaults = {}
         self._idle_timeouts = {}
         self._auth_events = {}
+        self._accounting_events = {}
 
     def __contains__(self, user_id):
         return user_id in self._credentials
@@ -260,6 +280,10 @@ class UserRegistry:
         clone._auth_events = {
             user_id: list(events)
             for user_id, events in self._auth_events.items()
+        }
+        clone._accounting_events = {
+            session_id: list(events)
+            for session_id, events in self._accounting_events.items()
         }
         return clone
 
@@ -281,6 +305,28 @@ class UserRegistry:
         if user_id not in self._credentials:
             raise UnknownUserError(user_id)
         return list(self._auth_events.get(user_id, ()))
+
+    def _record_accounting_stop(self, session_id, now, reason):
+        """在会话首次被判为终态时追加 stop 计费事件。
+
+        每个会话至多一条 stop：已存在 stop 事件（轨迹已有两条）时不改写、
+        不追加，重复观察同一终态幂等。
+        """
+        events = self._accounting_events.get(session_id)
+        if events is not None and len(events) < 2:
+            events.append(("stop", now, reason))
+
+    def list_accounting_events(self, session_id):
+        """返回 (user_id, 该会话计费轨迹的只读副本)（按提交顺序）。
+
+        轨迹中的每条记录为 (event_type, now, reason)，至多一条 start 加
+        一条 stop，编号由调用方按 1 起始的位置派生。不修改任何状态。
+        未知会话抛出 UnknownSessionError。
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise UnknownSessionError(session_id)
+        return record[0], list(self._accounting_events.get(session_id, ()))
 
     def register(self, user_id, password, salt):
         """登记用户；salt 为 16 字节。重复登记抛出 DuplicateUserError。"""
@@ -404,6 +450,8 @@ class UserRegistry:
             now,
             False,
         )
+        # 成功创建会话：追加且仅追加一条 start 计费事件，时间取请求 now。
+        self._accounting_events[session_id] = [("start", now, None)]
         return ("accepted", None, expires_at)
 
     def set_session_limit(self, user_id, max_sessions):
@@ -504,11 +552,15 @@ class UserRegistry:
                 user_id, expires_at, now, None,
                 idle_timeout, last_activity, False,
             )
+            self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
                 idle_timeout, last_activity, True,
+            )
+            self._record_accounting_stop(
+                session_id, now, "session_idle_expired"
             )
             return ("denied", "session_idle_expired", user_id)
         # 会话仍有效：提交检查时间并刷新最近活动时间。
@@ -573,11 +625,15 @@ class UserRegistry:
                 user_id, expires_at, now, None,
                 idle_timeout, last_activity, False,
             )
+            self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id, expires_at)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
                 idle_timeout, last_activity, True,
+            )
+            self._record_accounting_stop(
+                session_id, now, "session_idle_expired"
             )
             return ("denied", "session_idle_expired", user_id, expires_at)
         # 会话仍有效：提交检查时间并刷新最近活动时间。
@@ -635,11 +691,15 @@ class UserRegistry:
                 user_id, expires_at, now, None,
                 idle_timeout, last_activity, False,
             )
+            self._record_accounting_stop(session_id, now, "session_expired")
             return ("denied", "session_expired", user_id, None, expires_at)
         if self._idle_expired_now(idle_timeout, last_activity, now):
             self._sessions[session_id] = (
                 user_id, expires_at, now, None,
                 idle_timeout, last_activity, True,
+            )
+            self._record_accounting_stop(
+                session_id, now, "session_idle_expired"
             )
             return (
                 "denied", "session_idle_expired", user_id, None, expires_at,
@@ -647,6 +707,7 @@ class UserRegistry:
         self._sessions[session_id] = (
             user_id, expires_at, now, now, idle_timeout, last_activity, False,
         )
+        self._record_accounting_stop(session_id, now, "session_terminated")
         return ("terminated", None, user_id, now, expires_at)
 
 
@@ -756,8 +817,8 @@ def _validate_operation(index, operation):
             "'authenticate_stateful', 'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
-            "'check_admission', 'set_session_idle_timeout' or "
-            "'list_authentication_events'",
+            "'check_admission', 'set_session_idle_timeout', "
+            "'list_authentication_events' or 'list_accounting_events'",
             EXIT_PARAMETER_ERROR,
         )
     expected = set(_REQUIRED_KEYS[kind])
@@ -856,6 +917,7 @@ def _validate_operation(index, operation):
         _OPERATION_VALIDATE_SESSION,
         _OPERATION_TERMINATE_SESSION,
         _OPERATION_CHECK_ADMISSION,
+        _OPERATION_LIST_ACCOUNTING_EVENTS,
     ):
         session_id = _validate_string_field(operation, "session_id", index)
         if not (
@@ -1334,6 +1396,41 @@ def run_batch(registry, operations):
                     ],
                 }
             )
+        elif kind == _OPERATION_LIST_ACCOUNTING_EVENTS:
+            session_id = op["session_id"]
+            try:
+                session_user_id, events = working.list_accounting_events(
+                    session_id
+                )
+            except UnknownSessionError:
+                raise BatchError(
+                    "unknown_session",
+                    index,
+                    "session not found: %s" % session_id,
+                    EXIT_UNKNOWN_SESSION,
+                )
+            # 只读：不推进任何时间、不改变状态、不追加事件；在副本上查询
+            # 即可反映本批先前已提交的事件，批次失败时整体回滚。
+            results.append(
+                {
+                    "operation": _OPERATION_LIST_ACCOUNTING_EVENTS,
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "status": "reported",
+                    "event_count": len(events),
+                    "events": [
+                        {
+                            "sequence": sequence,
+                            "event_type": event_type,
+                            "now": now,
+                            "reason": reason,
+                        }
+                        for sequence, (event_type, now, reason) in enumerate(
+                            events, start=1
+                        )
+                    ],
+                }
+            )
         else:
             session_id = op["session_id"]
             try:
@@ -1374,6 +1471,7 @@ def run_batch(registry, operations):
     registry._admission_defaults = working._admission_defaults
     registry._idle_timeouts = working._idle_timeouts
     registry._auth_events = working._auth_events
+    registry._accounting_events = working._accounting_events
     return results
 
 
@@ -1454,7 +1552,7 @@ def _build_parser():
             "authenticate_session / validate_session / terminate_session /\n"
             "set_session_limit / set_admission_policy / set_admission_default /\n"
             "check_admission / set_session_idle_timeout /\n"
-            "list_authentication_events 操作，\n"
+            "list_authentication_events / list_accounting_events 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
             "整批操作先全部校验，任一错误则注册表保持不变；全部成功后才提交。"
         ),
@@ -1613,6 +1711,24 @@ def _build_parser():
             "  和 0。事件不含口令、盐、编码凭据或摘要。引用未知用户整批\n"
             "  unknown_user。结果键序为 operation、user_id、status、event_count、\n"
             "  events，status 为 reported。\n"
+            "list_accounting_events:\n"
+            "  为指定 session_id 返回本进程当前批次内已提交的计费开始与停止事件，\n"
+            "  仅接收 operation 与 session_id。authenticate_session 成功创建会话时\n"
+            "  产生且仅产生一条 start 事件，时间取该请求显式传入的 now；口令拒绝、\n"
+            "  账户锁定、并发上限拒绝与整批异常均不产生开始事件。validate_session、\n"
+            "  check_admission 或 terminate_session 首次将已有会话判为终态时追加\n"
+            "  且仅追加一条 stop 事件：主动终止取首次 terminated_at、reason 为\n"
+            "  session_terminated；首次观察到硬过期取触发结果的 now、reason 为\n"
+            "  session_expired；首次观察到空闲过期取触发结果的 now、reason 为\n"
+            "  session_idle_expired。重复校验、重复终止或从另一入口再次观察同一\n"
+            "  终态不改写也不追加；尚未被这些入口观察到的超时不出现在轨迹中。\n"
+            "  每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条\n"
+            "  stop。查询只读：不推进用户或会话时间，也不生成事件；事件不含口令、\n"
+            "  盐或编码凭据。未知 session_id 整批 unknown_session（退出码 8）；\n"
+            "  字段缺失、多余或类型错误仍为 parameter_error。结果固定键序为\n"
+            "  operation、session_id、user_id、status、event_count、events，\n"
+            "  status 为 reported；events 按 sequence 升序，每项固定键序为\n"
+            "  sequence、event_type、now、reason。\n"
             "退出码:\n"
             "  0  成功（含 denied/invalid_password、account_locked、\n"
             "      session_expired、session_idle_expired、session_terminated、\n"

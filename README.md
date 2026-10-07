@@ -150,11 +150,32 @@
     错误仍为 `parameter_error`（退出码 2）。
   * 结果固定键序为 operation、user_id、status、event_count、events，
     status 为 reported。
+* `list_accounting_events`：为指定 session_id 返回本进程当前批次内已提交的
+  计费开始与停止事件，仅接收 operation 和 session_id。
+  * `authenticate_session` 成功创建会话时产生且仅产生一条 start 事件，时间
+    取该请求显式传入的 `now`；口令拒绝、账户锁定、并发上限拒绝与整批异常均
+    不产生开始事件。
+  * `validate_session`、`check_admission` 或 `terminate_session` 首次将已有
+    会话判为终态时追加且仅追加一条 stop 事件：主动终止取首次 terminated_at、
+    reason 为 session_terminated；首次观察到硬过期取触发结果的 `now`、reason
+    为 session_expired；首次观察到空闲过期取触发结果的 `now`、reason 为
+    session_idle_expired。重复校验、重复终止或从另一入口再次观察同一终态不改写
+    也不追加；尚未被这些入口观察到的超时不出现在轨迹中。
+  * 每个会话的 sequence 从 1 连续递增，正常轨迹至多一条 start 加一条 stop；
+    每个会话最多保存两条计费事件。
+  * 查询只读：不推进用户或会话时间，也不生成事件；事件不含口令、盐或编码
+    凭据；events 按 sequence 升序，每项固定键序为 sequence、event_type、
+    now、reason。
+  * 未知 session_id 整批 `unknown_session`（退出码 8）；字段缺失、额外字段
+    或类型错误仍为 `parameter_error`（退出码 2）。
+  * 结果固定键序为 operation、session_id、user_id、status、event_count、
+    events，status 为 reported。
 
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额、准入策略、默认准入动作、空闲超时配置与认证事件轨迹恢复到批次
+会话、并发限额、准入策略、默认准入动作、空闲超时配置、认证事件轨迹与计费事件
+轨迹恢复到批次
 开始前，普通
 拒绝、会话过期、
 空闲过期与会话终止作为成功结果提交。未知用户报
