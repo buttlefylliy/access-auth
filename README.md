@@ -99,11 +99,31 @@
   * 引用未知用户整批 `unknown_user`（退出码 5）。
   * 结果键序固定为 operation、user_id、status、default_action，status 为
     configured。
+* `set_admission_overrides`：为已登记用户配置有序准入覆盖规则，接收
+  user_id、`rules`。
+  * `rules` 是最多 64 项的 JSON 数组，每项为仅含 `port_id`、`vlan_id`
+    与 `action` 的对象；`port_id` 为 null 或 1..64 个无控制字符 (Cc) 的
+    Unicode 码点，`vlan_id` 为 null 或 1..4094 的 JSON 整数，null 表示该
+    维度通配；`action` 为字符串 `allow` 或 `deny`。
+  * `check_admission` 在会话有效性判定后、精确规则与默认动作之前按数组
+    顺序采用首条匹配的覆盖规则：`allow` 返回 accepted 且 reason 为 null，
+    `deny` 返回 denied/policy_denied；未命中则继续精确规则与默认动作判定。
+  * 新数组完整替换旧值并保留顺序，重复提交相同内容幂等，空数组表示清除；
+    未配置时原有精确规则、默认动作、拒绝原因与会话时间语义保持不变。
+  * 覆盖规则只影响 `check_admission` 的判定：不改变终止、硬过期与空闲
+    过期的既有优先级，不改变有效会话检查时间与活动时间的刷新规则，不产生
+    认证或计费事件，也不改写精确规则、默认动作、凭据、认证状态、已有会话、
+    并发限额或超时配置。
+  * 引用未知用户整批 `unknown_user`（退出码 5）。
+  * 结果键序固定为 operation、user_id、status、rule_count，status 为
+    configured。
 * `check_admission`：按注入时间检查会话有效性并按所属用户策略判定端口准入，
   接收 session_id、`now`、`port_id`、`vlan_id`，字段约束同上；会话状态与
   时间单调语义同 `validate_session`。
   * 已终止的会话返回 denied/session_terminated；已过期的会话返回
-    denied/session_expired；活动会话按所属用户策略精确匹配
+    denied/session_expired；活动会话先按所属用户的有序覆盖规则（见
+    `set_admission_overrides`）采用首条匹配项，未命中时按所属用户策略
+    精确匹配
     (port_id, vlan_id)：命中返回 accepted 且 reason 为 null；未命中时若该
     用户配置了默认准入动作，`allow` 返回 accepted 且 reason 为 null，
     `deny` 返回 denied/policy_denied；精确规则与默认动作均未配置返回
@@ -219,7 +239,8 @@
 会话仅驻留当前进程内存、不落盘；数量不超过本批成功创建数。
 
 整批操作先全部静态校验，再在注册表副本上依序执行；任一异常则凭据、认证状态、
-会话、并发限额、准入策略、默认准入动作、空闲超时配置、认证事件轨迹与计费事件
+会话、并发限额、准入策略、默认准入动作、准入覆盖规则、空闲超时配置、认证事件
+轨迹与计费事件
 轨迹恢复到批次
 开始前，普通
 拒绝、会话过期、

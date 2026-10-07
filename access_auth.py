@@ -5,9 +5,10 @@
 UTF-8 JSON 文档，按顺序执行 operations 数组中的 register / authenticate /
 authenticate_stateful / authenticate_session / validate_session /
 terminate_session / set_session_limit / set_admission_policy /
-set_admission_default / check_admission / set_session_idle_timeout /
-list_authentication_events / list_accounting_events /
-record_accounting_interim / reauthenticate_session 操作，
+set_admission_default / set_admission_overrides / check_admission /
+set_session_idle_timeout / list_authentication_events /
+list_accounting_events / record_accounting_interim /
+reauthenticate_session 操作，
 并向标准输出写入紧凑 JSON 结果。
 行为契约见 README.md 与 --help。
 """
@@ -43,6 +44,7 @@ PORT_ID_MAX_LENGTH = 64
 VLAN_ID_MIN = 1
 VLAN_ID_MAX = 4094
 MAX_POLICY_RULES = 64
+MAX_OVERRIDE_RULES = 64
 IDLE_TIMEOUT_MIN = 0
 IDLE_TIMEOUT_MAX = 86400
 MAX_ACCOUNTING_INTERIM_EVENTS = 64
@@ -70,6 +72,7 @@ _OPERATION_TERMINATE_SESSION = "terminate_session"
 _OPERATION_SET_SESSION_LIMIT = "set_session_limit"
 _OPERATION_SET_ADMISSION_POLICY = "set_admission_policy"
 _OPERATION_SET_ADMISSION_DEFAULT = "set_admission_default"
+_OPERATION_SET_ADMISSION_OVERRIDES = "set_admission_overrides"
 _OPERATION_CHECK_ADMISSION = "check_admission"
 _OPERATION_SET_SESSION_IDLE_TIMEOUT = "set_session_idle_timeout"
 _OPERATION_LIST_AUTHENTICATION_EVENTS = "list_authentication_events"
@@ -117,6 +120,11 @@ _REQUIRED_KEYS = {
         "operation",
         "user_id",
         "default_action",
+    ),
+    _OPERATION_SET_ADMISSION_OVERRIDES: (
+        "operation",
+        "user_id",
+        "rules",
     ),
     _OPERATION_CHECK_ADMISSION: (
         "operation",
@@ -245,6 +253,14 @@ class UserRegistry:
     （policy_denied）。策略与默认动作只影响 check_admission 的判定，
     不影响凭据、认证状态、已有会话与并发限额。
 
+    另维护每用户有序覆盖规则 _admission_overrides
+    （user_id -> tuple[(port_id, vlan_id, action)]，port_id/vlan_id
+    为 None 表示该维度通配，action 为 "allow"/"deny"）。check_admission
+    在会话有效性判定后、精确规则与默认动作之前按数组顺序采用首条匹配的
+    覆盖规则；未配置或空数组（已清除）时不影响原有精确规则、默认动作与
+    拒绝原因语义。覆盖规则只影响 check_admission 的判定，不产生认证或
+    计费事件，也不改变会话时间语义。
+
     另维护每用户空闲超时 _idle_timeouts（user_id -> int，秒）；
     未配置或配置为 0 均表示关闭空闲超时。配置只在创建会话时快照进会话
     记录，已有会话沿用创建时的配置；lifetime 仍是不可延长的硬期限。
@@ -292,6 +308,7 @@ class UserRegistry:
         self._session_limits = {}
         self._admission_policies = {}
         self._admission_defaults = {}
+        self._admission_overrides = {}
         self._idle_timeouts = {}
         self._auth_events = {}
         self._accounting_events = {}
@@ -307,6 +324,7 @@ class UserRegistry:
         clone._session_limits = dict(self._session_limits)
         clone._admission_policies = dict(self._admission_policies)
         clone._admission_defaults = dict(self._admission_defaults)
+        clone._admission_overrides = dict(self._admission_overrides)
         clone._idle_timeouts = dict(self._idle_timeouts)
         clone._auth_events = {
             user_id: list(events)
@@ -623,6 +641,21 @@ class UserRegistry:
             raise UnknownUserError(user_id)
         self._admission_defaults[user_id] = default_action
 
+    def set_admission_overrides(self, user_id, rules):
+        """为已登记用户设置有序准入覆盖规则。
+
+        rules 为 (port_id, vlan_id, action) 三元组的序列，port_id/vlan_id
+        为 None 表示该维度通配，action 为 "allow"/"deny"。新数组完整替换
+        旧值并保留顺序，重复提交相同内容幂等，空数组表示清除。覆盖规则在
+        check_admission 的会话有效性判定后、精确规则与默认动作之前按顺序
+        采用首条匹配项；不改写精确规则、默认动作、凭据、认证状态、已有
+        会话、并发限额或超时配置，也不产生认证或计费事件。
+        未知用户抛出 UnknownUserError。
+        """
+        if user_id not in self._credentials:
+            raise UnknownUserError(user_id)
+        self._admission_overrides[user_id] = tuple(rules)
+
     def set_session_idle_timeout(self, user_id, idle_timeout):
         """为已登记用户设置会话空闲超时（秒）；0 表示关闭。
 
@@ -648,7 +681,10 @@ class UserRegistry:
         返回 denied/session_idle_expired；否则先判断 now >= expires_at
         返回 denied/session_expired，再判断启用了空闲超时的会话
         now >= last_activity + idle_timeout，命中则置空闲过期终态并返回
-        denied/session_idle_expired。仍有效的会话按所属用户策略精确匹配
+        denied/session_idle_expired。仍有效的会话先按所属用户的有序覆盖
+        规则判定：按配置顺序采用首条 port_id 与 vlan_id 均匹配（null 为
+        该维度通配）的规则，allow 返回 accepted、deny 返回
+        denied/policy_denied；未命中覆盖规则时按所属用户策略精确匹配
         (port_id, vlan_id)：命中返回 accepted；未命中时若该用户配置了默认
         准入动作，allow 返回 accepted、deny 返回 denied/policy_denied；
         精确规则与默认动作均未配置返回 denied/policy_not_configured；
@@ -703,6 +739,18 @@ class UserRegistry:
         self._sessions[session_id] = (
             user_id, expires_at, now, None, idle_timeout, now, False,
         )
+        # 有序覆盖规则优先于精确规则与默认动作：按顺序采用首条匹配项。
+        for rule_port_id, rule_vlan_id, rule_action in (
+            self._admission_overrides.get(user_id, ())
+        ):
+            if (
+                rule_port_id is None or rule_port_id == port_id
+            ) and (
+                rule_vlan_id is None or rule_vlan_id == vlan_id
+            ):
+                if rule_action == "allow":
+                    return ("accepted", None, user_id)
+                return ("denied", "policy_denied", user_id)
         policy = self._admission_policies.get(user_id)
         if policy is not None and (port_id, vlan_id) in policy:
             return ("accepted", None, user_id)
@@ -1031,7 +1079,8 @@ def _validate_operation(index, operation):
             "'authenticate_stateful', 'authenticate_session', "
             "'validate_session', 'terminate_session', 'set_session_limit', "
             "'set_admission_policy', 'set_admission_default', "
-            "'check_admission', 'set_session_idle_timeout', "
+            "'set_admission_overrides', 'check_admission', "
+            "'set_session_idle_timeout', "
             "'list_authentication_events', 'list_accounting_events', "
             "'record_accounting_interim' or 'reauthenticate_session'",
             EXIT_PARAMETER_ERROR,
@@ -1059,6 +1108,7 @@ def _validate_operation(index, operation):
         _OPERATION_SET_SESSION_LIMIT,
         _OPERATION_SET_ADMISSION_POLICY,
         _OPERATION_SET_ADMISSION_DEFAULT,
+        _OPERATION_SET_ADMISSION_OVERRIDES,
         _OPERATION_SET_SESSION_IDLE_TIMEOUT,
         _OPERATION_LIST_AUTHENTICATION_EVENTS,
     )
@@ -1317,6 +1367,86 @@ def _validate_operation(index, operation):
             )
         validated["default_action"] = default_action
 
+    if kind == _OPERATION_SET_ADMISSION_OVERRIDES:
+        rules = operation.get("rules")
+        if not isinstance(rules, list):
+            raise BatchError(
+                "parameter_error",
+                index,
+                "field 'rules' must be an array",
+                EXIT_PARAMETER_ERROR,
+            )
+        # 先完成全部结构/类型校验（parameter_error），再做取值校验
+        # （value_error），保证错误分型与字段顺序无关。
+        for rule_index, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d] must be a JSON object" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            if set(rule) != {"port_id", "vlan_id", "action"}:
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d] must contain exactly 'port_id', 'vlan_id' "
+                    "and 'action'" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            port_id = rule["port_id"]
+            if port_id is not None and not isinstance(port_id, str):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d].port_id must be a string or null" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            vlan_id = rule["vlan_id"]
+            if vlan_id is not None and (
+                isinstance(vlan_id, bool) or not isinstance(vlan_id, int)
+            ):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d].vlan_id must be a JSON integer or null"
+                    % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+            if not isinstance(rule["action"], str):
+                raise BatchError(
+                    "parameter_error",
+                    index,
+                    "rules[%d].action must be a string" % rule_index,
+                    EXIT_PARAMETER_ERROR,
+                )
+        if len(rules) > MAX_OVERRIDE_RULES:
+            raise BatchError(
+                "value_error",
+                index,
+                "rules must contain at most %d entries, got %d"
+                % (MAX_OVERRIDE_RULES, len(rules)),
+                EXIT_VALUE_ERROR,
+            )
+        triples = []
+        for rule in rules:
+            port_id = rule["port_id"]
+            if port_id is not None:
+                _validate_port_id(rule, "port_id", index)
+            vlan_id = rule["vlan_id"]
+            if vlan_id is not None:
+                _validate_vlan_id(rule, "vlan_id", index)
+            action = rule["action"]
+            if action not in ("allow", "deny"):
+                raise BatchError(
+                    "value_error",
+                    index,
+                    "action must be 'allow' or 'deny', got %r" % action,
+                    EXIT_VALUE_ERROR,
+                )
+            triples.append((port_id, vlan_id, action))
+        validated["rules"] = triples
+
     if kind == _OPERATION_CHECK_ADMISSION:
         validated["port_id"] = _validate_port_id(operation, "port_id", index)
         validated["vlan_id"] = _validate_vlan_id(operation, "vlan_id", index)
@@ -1555,6 +1685,25 @@ def run_batch(registry, operations):
                     "user_id": user_id,
                     "status": "configured",
                     "default_action": op["default_action"],
+                }
+            )
+        elif kind == _OPERATION_SET_ADMISSION_OVERRIDES:
+            user_id = op["user_id"]
+            try:
+                working.set_admission_overrides(user_id, op["rules"])
+            except UnknownUserError:
+                raise BatchError(
+                    "unknown_user",
+                    index,
+                    "user not registered: %s" % user_id,
+                    EXIT_UNKNOWN_USER,
+                )
+            results.append(
+                {
+                    "operation": _OPERATION_SET_ADMISSION_OVERRIDES,
+                    "user_id": user_id,
+                    "status": "configured",
+                    "rule_count": len(op["rules"]),
                 }
             )
         elif kind == _OPERATION_SET_SESSION_IDLE_TIMEOUT:
@@ -1818,6 +1967,7 @@ def run_batch(registry, operations):
     registry._session_limits = working._session_limits
     registry._admission_policies = working._admission_policies
     registry._admission_defaults = working._admission_defaults
+    registry._admission_overrides = working._admission_overrides
     registry._idle_timeouts = working._idle_timeouts
     registry._auth_events = working._auth_events
     registry._accounting_events = working._accounting_events
@@ -1900,7 +2050,7 @@ def _build_parser():
             "register / authenticate / authenticate_stateful /\n"
             "authenticate_session / validate_session / terminate_session /\n"
             "set_session_limit / set_admission_policy / set_admission_default /\n"
-            "check_admission / set_session_idle_timeout /\n"
+            "set_admission_overrides / check_admission / set_session_idle_timeout /\n"
             "list_authentication_events / list_accounting_events /\n"
             "record_accounting_interim / reauthenticate_session 操作，\n"
             "向标准输出写入紧凑 JSON 结果。\n"
@@ -1928,6 +2078,10 @@ def _build_parser():
             "  port_id 与 vlan_id 的对象；(port_id, vlan_id) 匹配对不得重复，\n"
             "  顺序不影响策略语义。\n"
             "  default_action (仅 set_admission_default): 字符串 'allow' 或 'deny'。\n"
+            "  rules (仅 set_admission_overrides): 最多 64 项的 JSON 数组，每项为\n"
+            "  仅含 port_id、vlan_id 与 action 的对象；port_id 为 null 或同上的\n"
+            "  端口标识，vlan_id 为 null 或 1..4094 的 JSON 整数，null 表示该维度\n"
+            "  通配；action 为字符串 'allow' 或 'deny'。\n"
             "  字符串按原值处理：不去空白、不改大小写、不做 Unicode 归一化。\n"
             "  操作对象只允许上述字段；凭据编码为\n"
             "  pbkdf2_sha256$200000$盐十六进制$摘要十六进制，输出不含明文口令。\n"
@@ -2010,6 +2164,21 @@ def _build_parser():
             "  check_admission 时使用新值。引用未知用户整批 unknown_user。\n"
             "  结果键序为 operation、user_id、status、default_action，status 为\n"
             "  configured。\n"
+            "set_admission_overrides:\n"
+            "  为已登记用户配置有序准入覆盖规则，接收 user_id 与 rules。rules 是\n"
+            "  最多 64 项的 JSON 数组，每项为仅含 port_id、vlan_id 与 action 的\n"
+            "  对象；port_id 为 null 或 1..64 个无控制字符 (Cc) 的 Unicode 码点，\n"
+            "  vlan_id 为 null 或 1..4094 的 JSON 整数，null 表示该维度通配；\n"
+            "  action 为字符串 'allow' 或 'deny'。check_admission 在会话有效性\n"
+            "  判定后、精确规则与默认动作之前按数组顺序采用首条匹配的覆盖规则：\n"
+            "  allow 返回 accepted 且 reason 为 null，deny 返回\n"
+            "  denied/policy_denied；未命中则继续精确规则与默认动作判定。新数组\n"
+            "  完整替换旧值并保留顺序，重复提交相同内容幂等，空数组表示清除。\n"
+            "  覆盖规则只影响 check_admission 的判定，不改写精确规则、默认动作、\n"
+            "  凭据、认证状态、已有会话、并发限额或超时配置，不改变终止、硬过期\n"
+            "  与空闲过期的优先级及活动时间刷新规则，也不产生认证或计费事件。\n"
+            "  引用未知用户整批 unknown_user。结果键序为 operation、user_id、\n"
+            "  status、rule_count，status 为 configured。\n"
             "check_admission:\n"
             "  按注入时间检查会话有效性并按所属用户策略判定端口准入，接收\n"
             "  session_id、now、port_id、vlan_id，字段约束同上。会话状态与时间\n"
@@ -2019,8 +2188,9 @@ def _build_parser():
             "  denied/session_terminated；已处于空闲过期终态的会话返回\n"
             "  denied/session_idle_expired；已过期的会话返回 denied/session_expired；\n"
             "  启用了空闲超时的会话 now 达到 最近活动时间+idle_timeout 时置空闲\n"
-            "  过期终态并返回 denied/session_idle_expired；仍有效的会话按所属\n"
-            "  用户策略精确匹配 (port_id, vlan_id)：命中返回\n"
+            "  过期终态并返回 denied/session_idle_expired；仍有效的会话先按所属\n"
+            "  用户的有序覆盖规则（见 set_admission_overrides）采用首条匹配项，\n"
+            "  未命中时按所属用户策略精确匹配 (port_id, vlan_id)：命中返回\n"
             "  accepted 且 reason 为 null；未命中时若该用户配置了默认准入动作，\n"
             "  allow 返回 accepted 且 reason 为 null，deny 返回\n"
             "  denied/policy_denied；精确规则与默认动作均未配置返回\n"
